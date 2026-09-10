@@ -113,6 +113,12 @@ execution retains its existing business claimant; the generic scanner excludes
 subagent Sessions. Deterministic supervision reminders remain delivery operations.
 
 Normal and recovered background completion share the same per-kind finalizer.
+Ordinary trigger completion summaries are platform history and WebSocket updates
+only, even when the trigger was created in an IM conversation. Neither initial
+completion nor recovery sends those summaries through an IM provider. Explicit
+message/file tools retain their delivery, as do exact `on_message` origin
+continuations and A2A callbacks. Historical summary receipts do not authorize
+recovery to introduce an additional external send.
 The terminal reply, business state and finalization marker commit together;
 later reconciliation only finishes missing business writes or delivery. Trigger
 completion owns webhook consumption; Task completion owns task status/logs;

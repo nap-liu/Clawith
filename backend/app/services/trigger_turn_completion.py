@@ -82,7 +82,7 @@ async def _project_reply(db, anchor, reply_row, *, agent_id, target, content, a2
             external_event_key=f"trigger-result:{anchor.id}:{target.id}",
             message_meta=attach_delivery_to_meta(
                 meta, IMDeliveryResult.pending(str(target.source_channel or "web")),
-            ),
+            ) if a2a else meta,
         )
         db.add(row)
         target.last_message_at = datetime.now(timezone.utc)
@@ -194,7 +194,8 @@ async def finalize_trigger_turn(db, anchor: ChatMessage, reply_row: ChatMessage 
 
 
 async def deliver_trigger_turn(anchor: ChatMessage, reply_row: ChatMessage | None) -> bool:
-    """Retry only shared receipt delivery after the business transaction commits."""
+    """Publish background summaries on the platform; preserve actual continuations."""
+    from app.api.websocket import manager as ws_manager
     from app.services.turn_runtime import deliver_recovered_reply_to_origin
 
     if reply_row is None:
@@ -203,18 +204,37 @@ async def deliver_trigger_turn(anchor: ChatMessage, reply_row: ChatMessage | Non
     completion = execution.get("completion") or {}
     triggers = completion.get("triggers") or []
     cfg = triggers[0].get("config") or {} if triggers else {}
+    platform_summary = not completion.get("origin") and not cfg.get("_a2a_session_id")
     for row_id in (reply_row.message_meta or {}).get("trigger_delivery_ids", []):
         async with async_session() as db:
             row = await db.get(ChatMessage, uuid.UUID(str(row_id)))
             if row is None:
                 return False
+            if platform_summary:
+                target = await db.get(ChatSession, uuid.UUID(row.conversation_id))
+                if target is None or target.agent_id != anchor.agent_id:
+                    continue
+                owner_user_id = target.user_id
+            else:
+                owner_user_id = None
             receipt = dict((row.message_meta or {}).get("delivery") or {})
-            if receipt.get("status") in {"sent", "unsupported"}:
-                continue
-            if receipt.get("status") != "pending":
-                return False
+            if not platform_summary:
+                if receipt.get("status") in {"sent", "unsupported"}:
+                    continue
+                if receipt.get("status") != "pending":
+                    return False
             conversation_id, content = row.conversation_id, row.content
             storage_agent_id = row.agent_id
+        if platform_summary:
+            # This also handles pre-fix summaries with pending IM receipts:
+            # reconciliation must never turn a platform summary into an IM send.
+            if owner_user_id:
+                await ws_manager.send_to_user(str(storage_agent_id), str(owner_user_id), {
+                    "type": "trigger_notification", "content": content,
+                    "triggers": [item.get("name") for item in triggers],
+                    "session_id": conversation_id,
+                })
+            continue
         delivered = await deliver_recovered_reply_to_origin(
             agent_id=storage_agent_id,
             conversation_id=conversation_id,

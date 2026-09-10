@@ -113,7 +113,7 @@ async def test_concurrent_workers_claim_independent_timer_occurrences_once():
         assert len(requests) == 3
 
 
-async def test_webhook_two_process_losses_preserve_batch_and_sent_receipt_tail(monkeypatch):
+async def test_webhook_two_process_losses_preserve_batch_and_platform_summary(monkeypatch):
     gates = [asyncio.Event(), asyncio.Event()]
     child_pids = []
     spawn = asyncio.create_subprocess_exec
@@ -165,36 +165,31 @@ async def test_webhook_two_process_losses_preserve_batch_and_sent_receipt_tail(m
                     original_conversation = original_conversation or execution.conversation_id
                     assert execution.conversation_id == original_conversation
                 gates[interruption].set()
-            # Crash after the actual shared receipt writer commits a successful
-            # send, before the background completion marker can be committed.
-            from app.services import im_delivery
+            # A process loss before the platform event must preserve the durable
+            # summary without introducing an external delivery on recovery.
+            from app.api.websocket import manager
 
-            register = im_delivery.register_delivery
-            receipt_commits = []
-
-            async def exit_after_receipt(message_id, result):
-                persisted = await register(message_id, result)
-                if result.status == "sent":
-                    receipt_commits.append(message_id)
-                    raise TurnInterrupted("process lost after receipt commit")
-                return persisted
+            async def exit_before_notification(*args, **kwargs):
+                raise TurnInterrupted("process lost before platform notification")
 
             await claim_own({execution_id}, ["webhook"])
             runtime = await runtime_for(execution_id)
             with monkeypatch.context() as patch:
-                patch.setattr(im_delivery, "register_delivery", exit_after_receipt)
+                patch.setattr(manager, "send_to_user", exit_before_notification)
                 async with active_turn_boundary():
                     with pytest.raises(TurnInterrupted):
                         await _invoke_agent_for_triggers(agent_id, [runtime])
-            assert len(receipt_commits) == 1
             async with async_session() as db:
                 execution = await db.get(TriggerExecution, execution_id)
                 assert execution.status == "completed"
                 anchor = await db.scalar(select(ChatMessage).where(
                     ChatMessage.conversation_id == str(original_conversation), ChatMessage.role == "user"))
                 assert anchor.message_meta["background_execution"]["delivered"] is False
-                receipt = await db.get(ChatMessage, receipt_commits[0])
-                assert receipt.message_meta["delivery"]["status"] == "sent"
+                summaries = list(await db.scalars(select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(origin_id),
+                    ChatMessage.message_meta["trigger_turn_anchor_id"].as_string() == str(anchor.id))))
+                assert len(summaries) == 1
+                assert "delivery" not in summaries[0].message_meta
             # Two late dispatchers both observe the original terminal turn.
             async with active_turn_boundary():
                 await asyncio.gather(_invoke_agent_for_triggers(agent_id, [runtime]),
@@ -223,9 +218,21 @@ async def test_webhook_two_process_losses_preserve_batch_and_sent_receipt_tail(m
                 gate.set()
 
 
-async def test_on_message_and_async_wake_use_actual_shared_executor():
+@pytest.mark.parametrize("channel", ["web", "dingtalk"])
+async def test_on_message_and_async_wake_use_actual_shared_executor(monkeypatch, channel):
+    from app.services import turn_runtime
+    from app.services.im_delivery import IMDeliveryResult, register_delivery
+
+    deliveries = []
+
+    async def deliver(**kwargs):
+        deliveries.append(kwargs)
+        await register_delivery(kwargs["message_id"], IMDeliveryResult.sent(channel))
+        return True
+
+    monkeypatch.setattr(turn_runtime, "deliver_recovered_reply_to_origin", deliver)
     async with provider([{"content": "Subscription handled."}, {"content": "Wake handled."}]) as (url, requests):
-        agent_id, user_id, origin_id, origin_anchor_id, _ = await seed(url)
+        agent_id, user_id, origin_id, origin_anchor_id, _ = await seed(url, channel)
         async with async_session() as db:
             await persist_assistant_reply_row(db, agent_id=agent_id, user_id=user_id,
                 conversation_id=str(origin_id), content="Subscription armed.", turn_anchor_id=origin_anchor_id)
@@ -242,7 +249,7 @@ async def test_on_message_and_async_wake_use_actual_shared_executor():
             await db.flush()
             execution, _ = await enqueue_trigger_execution(db,trigger=trigger,source="on_message",
                 idempotency_key=str(matched.id),commit=False,payload_obj={
-                    "_origin_session_id":str(origin_id), "_origin_source_channel":"web",
+                    "_origin_session_id":str(origin_id), "_origin_source_channel":channel,
                     "_origin_turn_anchor_id":str(origin_anchor_id), "_matched_message_id":str(matched.id),
                     "_watch_session_id":str(watched.id)})
             await db.commit()
@@ -269,6 +276,78 @@ async def test_on_message_and_async_wake_use_actual_shared_executor():
                 await asyncio.sleep(.02)
         assert await run_background_turn(wake.id) == "Wake handled."
         assert len(requests) == 2
+        assert len(deliveries) == 1
+        assert deliveries[0]["conversation_id"] == str(origin_id)
+        assert deliveries[0]["reply"] == "Subscription handled."
+
+
+@pytest.mark.parametrize("channel", ["web", "dingtalk"])
+async def test_timer_summary_and_legacy_recovery_never_send_im(monkeypatch, channel):
+    from app.api.websocket import manager
+    from app.services import turn_runtime
+    from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+    notifications = []
+    deliveries = []
+
+    async def notify(agent_id, user_id, message):
+        notifications.append((agent_id, user_id, message))
+
+    async def unexpected_delivery(**kwargs):
+        deliveries.append(kwargs)
+        return True
+
+    monkeypatch.setattr(manager, "send_to_user", notify)
+    monkeypatch.setattr(turn_runtime, "deliver_recovered_reply_to_origin", unexpected_delivery)
+    async with provider([{"content": "No new cases. No notification needed."}]) as (url, requests):
+        agent_id, user_id, origin_id, _, _ = await seed(url, channel)
+        async with async_session() as db:
+            trigger = AgentTrigger(agent_id=agent_id, execution_user_id=user_id, type="cron",
+                name="monitor", reason="Notify only when new cases are found", soul=False, memory=False,
+                config={"expr": "0 * * * *", "_origin_session_id": str(origin_id),
+                        "_origin_source_channel": channel})
+            db.add(trigger)
+            await db.flush()
+            execution, _ = await enqueue_trigger_execution(db, trigger=trigger, source="cron",
+                idempotency_key=uuid.uuid4().hex, commit=False)
+            await db.commit()
+        runtime = await runtime_for(execution.id)
+        async with active_turn_boundary():
+            await _invoke_agent_for_triggers(agent_id, [runtime])
+        assert len(notifications) == 1
+        assert notifications[0][:2] == (str(agent_id), str(user_id))
+        assert notifications[0][2]["type"] == "trigger_notification"
+        assert notifications[0][2]["session_id"] == str(origin_id)
+        assert "No new cases." in notifications[0][2]["content"]
+        async with async_session() as db:
+            execution = await db.get(TriggerExecution, execution.id)
+            assert execution.status == "completed"
+            anchor = await db.scalar(select(ChatMessage).where(
+                ChatMessage.conversation_id == str(execution.conversation_id), ChatMessage.role == "user"))
+            summary = await db.scalar(select(ChatMessage).where(
+                ChatMessage.conversation_id == str(origin_id),
+                ChatMessage.message_meta["trigger_turn_anchor_id"].as_string() == str(anchor.id)))
+            assert summary.content == notifications[0][2]["content"]
+            assert "delivery" not in summary.message_meta
+            assert anchor.message_meta["background_execution"]["delivered"] is True
+            # Simulate an outgoing version's terminal summary with pending IM
+            # delivery. The new recovery must publish only the platform event.
+            summary.message_meta = attach_delivery_to_meta(summary.message_meta, IMDeliveryResult.pending(channel))
+            anchor.message_meta = {**anchor.message_meta, "background_execution": {
+                **anchor.message_meta["background_execution"], "delivered": False}}
+            await db.commit()
+        async with active_turn_boundary():
+            await run_background_turn(anchor.id)
+            await run_background_turn(anchor.id)
+        assert deliveries == []
+        assert len(requests) == 1
+        assert len(notifications) == 2
+        async with async_session() as db:
+            anchor = await db.get(ChatMessage, anchor.id)
+            assert anchor.message_meta["background_execution"]["delivered"] is True
+            assert await db.scalar(select(func.count()).select_from(ChatMessage).where(
+                ChatMessage.conversation_id == str(origin_id),
+                ChatMessage.message_meta["trigger_turn_anchor_id"].as_string() == str(anchor.id))) == 1
 
 
 async def _claim_worker():
