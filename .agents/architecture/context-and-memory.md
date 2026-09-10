@@ -72,7 +72,7 @@ visible; do not collapse them into a false “not found” or canned success.
 
 ## Scene prompt blocks
 
-Each scene system-prompt block accepts up to 24,000 characters through the
+Each scene system-prompt block accepts up to 30,000 characters through the
 settings editor, scene API, and seeded `manage_scene` tool schema. Enabled
 blocks are loaded in order without per-block truncation; model context budgets
 still apply. Raising the input limit does not restore previously truncated text.

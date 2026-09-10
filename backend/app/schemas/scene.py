@@ -18,7 +18,7 @@ HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 class SceneSystemPrompt(BaseModel):
     id: str = Field(max_length=64)
     name: str = Field(min_length=1, max_length=80)
-    content: str = Field(min_length=1, max_length=24000)
+    content: str = Field(min_length=1, max_length=30000)
     enabled: bool = True
 
     @field_validator("id")

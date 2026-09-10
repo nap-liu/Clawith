@@ -567,7 +567,7 @@ export default function SceneConfigTab({
                                         </>
                                     )}
                                 </div>
-                                <textarea value={prompt.content} maxLength={24000} readOnly={isPreviewing} onChange={(e) => updatePrompt(index, { content: e.target.value })} placeholder="请输入需要追加的系统指令" />
+                                <textarea value={prompt.content} maxLength={30000} readOnly={isPreviewing} onChange={(e) => updatePrompt(index, { content: e.target.value })} placeholder="请输入需要追加的系统指令" />
                             </article>
                         ))}
                         {visibleScene.system_prompts.length === 0 && <div className="scene-config__empty">尚未配置场景提示词。</div>}
