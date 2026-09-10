@@ -81,6 +81,7 @@ async def execute_tool_preflight(
     skip_autonomy: bool = False,
     tools_for_llm: list[dict] | None = None,
     approved_by_human: bool = False,
+    on_progress=None,
 ) -> str | ExecuteToolDispatchContext:
     """Execute a tool call and return the result as a string.
 
@@ -193,6 +194,11 @@ async def execute_tool_preflight(
                     memory=arguments.get("memory", True) is not False,
                     turn_anchor_id=turn_anchor_id,
                 )
+                if on_progress is not None:
+                    await on_progress({
+                        "session_id": str(run.id),
+                        "execution_agent_id": str(agent_id),
+                    })
                 if run.mode == "async":
                     return json.dumps(
                         {

@@ -122,6 +122,8 @@ export function mergeToolCallProjection(
         : secondaryArgs,
     toolStatus: selectedStatus,
     toolResult: primaryResult || secondaryResult || "",
+    toolSessionRef: primary.toolSessionRef ?? primaryParsed.session_ref
+      ?? secondary.toolSessionRef ?? secondaryParsed.session_ref,
     streaming:
       selectedStatus === "running" &&
       Boolean(primary.streaming || secondary.streaming),
@@ -179,6 +181,7 @@ export function toolCallMessageFromEvent(
     toolArgs: parseToolArgs(data.args ?? data.toolArgs),
     toolStatus: status,
     toolResult: normalizeToolResult(data.result ?? data.toolResult) || "",
+    toolSessionRef: data.session_ref ?? data.toolSessionRef,
     toolThinking: data.reasoning_content || data.toolThinking || "",
     turnAnchorId,
     turnGeneration: Number.isInteger(Number(turn.generation))

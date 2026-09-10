@@ -98,6 +98,7 @@ export function mapHistoryMessage(
       toolArgs,
       toolStatus: normalizeToolStatus(raw.toolStatus || parsed.status),
       toolResult: normalizeToolResult(raw.toolResult ?? parsed.result) || "",
+      toolSessionRef: raw.toolSessionRef ?? parsed.session_ref,
       toolThinking: raw.toolThinking || parsed.reasoning_content || "",
       mediaTaskId: raw.mediaTaskId || undefined,
       timestamp: raw.timestamp || raw.created_at || undefined,

@@ -22,6 +22,7 @@ export type ConversationMessage = {
   toolArgs?: any;
   toolStatus?: ConversationToolStatus;
   toolResult?: string;
+  toolSessionRef?: { session_id: string; execution_agent_id: string };
   toolThinking?: string;
   mediaTaskId?: string;
   fileName?: string;

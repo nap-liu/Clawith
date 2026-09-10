@@ -549,6 +549,42 @@ async def _process_tool_call(
         except Exception:
             pass
 
+    # A durable reference is display metadata, never a partial model result.
+    session_ref = None
+
+    async def on_progress(reference):
+        nonlocal session_ref
+        session_ref = dict(reference)
+        event = {
+            "name": tool_name,
+            "call_id": tc.get("id", ""),
+            "args": args,
+            "status": "running",
+            "session_ref": session_ref,
+            "round_id": round_id,
+            "round_tool_index": round_tool_index,
+            "reasoning_content": full_reasoning_content,
+            "assistant_content": assistant_content,
+            "responses_snapshot": responses_snapshot,
+            "recovery_prefix_messages": recovery_prefix_messages or [],
+        }
+        persisted = await _persist_tool_call_events_strict(
+            [event],
+            agent_id=persistence_agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+        row_id = persisted.get(str(event["call_id"]))
+        if row_id is not None:
+            event["_durable_persisted"] = True
+            event["_durable_message_id"] = str(row_id)
+        if on_tool_call:
+            try:
+                await on_tool_call({k: v for k, v in event.items() if k != "responses_snapshot"})
+            except Exception:
+                pass
+
     # Execute tool — pass on_output for execute_code streaming
     if before_execute is not None:
         await before_execute()
@@ -563,6 +599,7 @@ async def _process_tool_call(
         tool_call_id=str(tc.get("id") or ""),
         turn_anchor_id=turn_anchor_id,
         on_output=_on_output,
+        on_progress=on_progress,
         tools_for_llm=tools_for_llm,
     )
     logger.info(f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}")
@@ -614,6 +651,8 @@ async def _process_tool_call(
         "recovery_prefix_messages": recovery_prefix_messages or [],
     }
     done_row_id = _durable_tool_result_row_id(tool_name, str(llm_view), session_id)
+    if session_ref is not None:
+        done_evt["session_ref"] = session_ref
     if done_row_id is not None:
         done_evt["_durable_persisted"] = True
     else:

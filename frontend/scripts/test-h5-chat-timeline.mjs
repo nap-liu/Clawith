@@ -13,17 +13,19 @@ const server = await createServer({
 try {
     // Load the production dependency graph, including ChatToolCallRenderer.
     // Web and the H5 compatibility facade consume this same conversation core.
-    const [timeline, lifecycle, resumeRecovery, fileDelivery] = await Promise.all([
+    const [timeline, lifecycle, resumeRecovery, fileDelivery, subagentCard] = await Promise.all([
         server.ssrLoadModule('/src/features/conversation/core/chatTimeline.ts'),
         server.ssrLoadModule('/src/features/conversation/core/conversationTurnLifecycle.ts'),
         server.ssrLoadModule('/src/features/conversation/core/resumeRecovery.ts'),
         server.ssrLoadModule('/src/utils/chatFileDelivery.ts'),
+        server.ssrLoadModule('/src/components/SubagentRunCard.tsx'),
     ]);
     const testContext = {
         ...timeline,
         ...lifecycle,
         ...resumeRecovery,
         ...fileDelivery,
+        ...subagentCard,
         buildH5ConversationEntries: timeline.buildConversationEntries,
         getH5ScrollAnchor: timeline.getConversationScrollAnchor,
     };
