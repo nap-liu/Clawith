@@ -10,12 +10,13 @@ from app.config import get_settings
 from app.core.security import encrypt_data
 from app.models.agent import Agent
 from app.models.llm import LLMModel
-from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import AgentTool, Tool
 from app.services.media_ai_contract import MEDIA_AI_DEFAULTS, MEDIA_AI_NAMES
+from app.services.media_ai_io import MediaAIError
 from app.services.model_capabilities import MEDIA_MODEL_DEFAULTS
 from app.services.llm.utils import get_model_api_key
+from app.services.media_legacy_bindings import config_reference, locked_bindings
 from app.services.tool_config import decrypt_sensitive_fields, tenant_tool_config_key
 
 LEGACY_KEYS = frozenset({"api_key", "base_url", *MEDIA_AI_DEFAULTS})
@@ -29,20 +30,31 @@ def legacy_connection(config: dict) -> dict:
     return connection({**MEDIA_AI_DEFAULTS, **decrypt_sensitive_fields(config)})
 
 
-async def materialize_legacy_config(db, tenant_id, config: dict) -> dict:
+async def materialize_legacy_config(
+    db, tenant_id, config: dict, *, reference: str | None = None, required_slot: str | None = None,
+) -> dict:
     """Keep immutable scene revisions usable without executing inline secrets."""
+    if not config.get("api_key") and reference is None:
+        return dict(config)
+    # Existing tenant lock serializes startup and legacy scene admission without
+    # adding a registry, fingerprint column, or another configuration resource.
+    marker = await locked_bindings(db, tenant_id)
+    reference = reference or config_reference(decrypt_sensitive_fields(config))
+    converted = {key: value for key, value in config.items() if key not in LEGACY_KEYS}
+    bindings = dict((marker.value or {}).get("connections") or {})
+    if reference in bindings:
+        if required_slot and not bindings[reference].get(required_slot):
+            raise MediaAIError("modelUnavailable")
+        return {**converted, **bindings[reference]}
     if not config.get("api_key"):
         return dict(config)
     resolved = legacy_connection(config)
-    # Existing tenant lock serializes startup and legacy scene admission without
-    # adding a registry, fingerprint column, or another configuration resource.
-    await db.scalar(select(Tenant.id).where(Tenant.id == tenant_id).with_for_update())
-    converted = {key: value for key, value in config.items() if key not in LEGACY_KEYS}
     candidates = list((await db.scalars(select(LLMModel).where(
         LLMModel.tenant_id == tenant_id, LLMModel.provider == "qwen",
     ))).all())
     settings = get_settings()
     endpoint = resolved["base_url"] + "/compatible-mode/v1"
+    claimed = {}
     for slot, purpose in MEDIA_MODEL_DEFAULTS.items():
         if slot == "speech_model_id":
             continue  # Speech has its own historical source, not media tool credentials.
@@ -61,6 +73,8 @@ async def materialize_legacy_config(db, tenant_id, config: dict) -> dict:
                 selected = model
                 break
         if selected is None:
+            if marker.value.get("connections_unrecorded"):
+                continue
             modalities = (["text", "image", "audio", "video"] if kind in {"understanding", "video"}
                           else ["text", "image"] if kind == "image" else ["text"])
             selected = LLMModel(
@@ -76,8 +90,13 @@ async def materialize_legacy_config(db, tenant_id, config: dict) -> dict:
             db.add(selected)
             await db.flush()
             candidates.append(selected)
-        converted[slot] = str(selected.id)
-    return converted
+        claimed[slot] = str(selected.id)
+    if required_slot and not claimed.get(required_slot):
+        raise MediaAIError("modelUnavailable")
+    bindings[reference] = claimed
+    marker.value = {**marker.value, "connections": bindings}
+    await db.flush()
+    return {**converted, **claimed}
 
 
 async def restore_legacy_override(db, tenant_id, config: dict, slot: str) -> dict:
@@ -125,11 +144,13 @@ async def migrate_legacy_media_configs(db) -> int:
             effective = {**original, **override}
             if not effective.get("api_key"):
                 continue
-            assignment.config = await materialize_legacy_config(db, setting.tenant_id, effective)
+            assignment.config = await materialize_legacy_config(
+                db, setting.tenant_id, effective, reference=f"assignment:{assignment.id}",
+            )
             count += 1
         if original.get("api_key"):
             setting.value = {**dict(setting.value or {}), "config": await materialize_legacy_config(
-                db, setting.tenant_id, original,
+                db, setting.tenant_id, original, reference="company",
             )}
             count += 1
         elif any(key in original for key in LEGACY_KEYS):

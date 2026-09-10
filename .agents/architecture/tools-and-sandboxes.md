@@ -70,8 +70,12 @@ operation uses `/responses`. Unsupported native operations fail explicitly.
 Startup converts mutable legacy tenant and Agent connections to enterprise model
 references and clears old global media defaults. Published scene revisions and
 accepted task snapshots are not rewritten. A published legacy connection is
-materialized into a matching tenant model on admission; disabled matches stay
-disabled. The legacy transport reader remains for previously accepted tasks.
+bound once to tenant model IDs on admission. Internal tenant migration receipts
+retain those IDs independently of mutable model settings; scene references use
+the original override, not later inherited company connection values. New inputs
+read current model settings and reject deleted, disabled or ineligible models;
+they never recreate the old connection. The legacy transport reader remains for
+previously accepted tasks, whose encrypted snapshots are unchanged.
 Enterprise media tests submit to the same child worker using an authorized existing
 Agent workspace. The existing non-waking Subagent mode avoids an extra parent LLM
 call; HTTP still returns a task receipt immediately. Existing image generation
@@ -91,13 +95,27 @@ and signed URLs are not repeated inside those text labels.
 
 Startup moves old Agent assignments and tenant model references into `read_media`,
 preserving disabled states and preferring existing explicit media assignments.
-Old vision models gain the understanding purpose only within their owning tenant;
+Old vision models gain the understanding purpose once within their owning tenant;
+subsequent scene projection only reads the reference and respects purpose removal.
 invalid/foreign/disabled references do not silently select a different model.
 The old Tool UUID row remains a disabled legacy record, outside the normal catalog.
 Immutable scenes are not rewritten: their old UUID/config is projected onto the
 new tool at read time. Old `read_image(image_paths)` calls normalize before the
 ordinary permission check and enqueue the same asynchronous media task with the
 original OCR/transcription intent. No independent image understanding loop remains.
+
+For an already deployed legacy conversion without migration receipts, prior
+administrator changes cannot always be distinguished from an unseen scene.
+The upgrade conservatively preserves existing vision purposes rather than adding
+them again; inline media connections may bind an exact existing model but cannot
+create a replacement when no match remains. Such scenes report `modelUnavailable`
+for the requested purpose until an administrator selects an explicit eligible
+enterprise model. An unmatched audio model does not block a matched image model;
+missing slots never fall through to a different company default. A complete
+first upgrade from the original builtin records its migration origin and still
+supports first-use conversion of scene-only legacy references. Receipts contain
+only reference hashes, model IDs and migration flags, never credentials; the
+existing tenant lock serializes their creation. Published scenes remain immutable.
 
 Legacy backup model configuration uses the same shared provider clients. Only an
 explicit retryable HTTP refusal before any text, reasoning or tool output permits

@@ -2,7 +2,7 @@
 
 from contextvars import ContextVar
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from inspect import signature
 from types import SimpleNamespace
@@ -17,6 +17,8 @@ from app.services.scene_tool_settings import project_settings
 from app.services.tool_config import decrypt_sensitive_fields, get_tool_company_config, merge_tool_config_layers
 from app.services.tool_enablement import REQUIRED_AGENT_TOOL_NAMES, tool_is_required, tool_visibility_clause
 from app.services.scene_service import load_turn_scene_context
+from app.services.media_model_migration import LEGACY_KEYS
+from app.services.media_legacy_bindings import config_reference
 
 
 @dataclass
@@ -26,6 +28,7 @@ class TurnToolSettings:
     configs: dict[str, dict]
     mcp_overrides: dict[str, dict]
     enabled_names: frozenset[str]
+    legacy_media_references: dict[str, str] = field(default_factory=dict)
 
 
 _current: ContextVar[TurnToolSettings | None] = ContextVar("turn_tool_settings", default=None)
@@ -62,6 +65,7 @@ async def _load_settings(agent_id, channel_context):
     assignments = []
     enabled_names = set()
     mcp_overrides = {}
+    legacy_media_references = {}
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
         if agent is None:
@@ -88,6 +92,11 @@ async def _load_settings(agent_id, channel_context):
                 continue
             company = await get_tool_company_config(db, tool, agent.tenant_id)
             item["config"] = decrypt_sensitive_fields(item.get("config", {}), tool.config_schema)
+            if tool.name in {"read_media", "generate_media"}:
+                if any(key in item["config"] for key in LEGACY_KEYS):
+                    legacy_media_references[tool.name] = "scene:" + config_reference({
+                        "tool_id": str(tool.id), "config": item["config"],
+                    })
             configs[tool.name] = merge_tool_config_layers(
                 decrypt_sensitive_fields(tool.config or {}, tool.config_schema),
                 company, item.get("config"), tool.config_schema,
@@ -112,7 +121,8 @@ async def _load_settings(agent_id, channel_context):
     }.items():
         if server_id in mcp_overrides:
             mcp_overrides[server_id].update({key: value for key, value in override.items() if key in _MCP_FIELDS and value is not None})
-    return TurnToolSettings(str(agent_id), assignments, configs, mcp_overrides, frozenset(enabled_names))
+    return TurnToolSettings(str(agent_id), assignments, configs, mcp_overrides,
+                            frozenset(enabled_names), legacy_media_references)
 
 
 @asynccontextmanager

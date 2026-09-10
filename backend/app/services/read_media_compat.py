@@ -11,6 +11,7 @@ from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
+from app.services.media_legacy_bindings import locked_bindings
 from app.services.tool_config import get_tool_company_config, get_tenant_tool_config, set_tenant_tool_config
 
 IMAGE_PROMPT = (
@@ -32,15 +33,31 @@ def normalize_read_image_call(name: str, arguments: dict) -> tuple[str, dict]:
 async def image_model_reference(db, tenant_id, config: dict) -> dict:
     """Reuse the original tenant model without enabling or copying its connection."""
     reference = config.get("model_id") or config.get("fallback_model_id")
+    marker = await locked_bindings(db, tenant_id)
+    value = dict(marker.value)
+    if "image_models" not in value:
+        retired = await db.scalar(select(Tool.id).where(Tool.name == "read_image", Tool.source == "legacy"))
+        # An already deployed migration left no receipts. Absence of a purpose
+        # cannot distinguish an unseen scene from an administrator's revocation.
+        value["image_models"] = ([str(item) for item in await db.scalars(select(LLMModel.id).where(
+            LLMModel.tenant_id == tenant_id,
+        ))] if retired else [])
+    checked = value["image_models"]
     if not reference:
+        marker.value = value
+        await db.flush()
         return {}
     try:
         model = await db.get(LLMModel, uuid.UUID(str(reference)))
     except (ValueError, TypeError):
         return {"understanding_model_id": str(reference)}
-    if model is not None and model.tenant_id == tenant_id and model.supports_vision:
+    if (str(reference) not in checked and model is not None
+            and model.tenant_id == tenant_id and model.supports_vision):
         model.purposes = list(dict.fromkeys([*(model.purposes or ["conversation"]), "media_understanding"]))
         model.input_modalities = list(dict.fromkeys([*(model.input_modalities or ["text"]), "image"]))
+    value["image_models"] = list(dict.fromkeys([*checked, str(reference)]))
+    marker.value = value
+    await db.flush()
     # Invalid, disabled or foreign references remain invalid at ordinary admission;
     # never silently select the company's different model in their place.
     result = {"understanding_model_id": str(reference)}
@@ -53,7 +70,11 @@ async def image_model_reference(db, tenant_id, config: dict) -> dict:
 async def migrate_read_image(db) -> None:
     old = await db.scalar(select(Tool).where(Tool.name == "read_image", Tool.type == "builtin"))
     new = await db.scalar(select(Tool).where(Tool.name == "read_media", Tool.type == "builtin"))
-    if old is None or new is None or old.source == "legacy":
+    if old is None or new is None:
+        return
+    if old.source == "legacy":
+        for tenant_id in await db.scalars(select(Tenant.id)):
+            await image_model_reference(db, tenant_id, {})
         return
     was_enabled = old.enabled
     tenants = list(await db.scalars(select(Tenant)))

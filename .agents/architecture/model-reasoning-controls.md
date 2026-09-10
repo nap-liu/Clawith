@@ -232,6 +232,15 @@ otherwise inherit those defaults. Media model tests select an existing Digital
 Employee workspace and execute through the shared asynchronous media runtime;
 results use the existing session viewer and task card, without another queue.
 
+Legacy inline media connections and image-tool purposes migrate once. Internal
+tenant migration receipts bind old references to model IDs, so administrator
+changes govern every new admission and deletion returns `modelUnavailable`.
+Already accepted jobs retain their encrypted model snapshot. Missing receipts
+from a previously deployed conversion use conservative compatibility: reuse a
+matching existing connection, but never recreate a removed or edited connection
+or grant a removed purpose. Administrators resolve ambiguous old scene settings
+by selecting an explicit enterprise model; ordinary model creation is unaffected.
+
 Speech input resolves `speech_model_id` from the same company defaults and reads
 the selected enterprise model's connection. Legacy speech-service records are
 migrated once into model records; clearing a selection or disabling a model must

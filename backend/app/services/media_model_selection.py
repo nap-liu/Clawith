@@ -16,12 +16,14 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
 from app.models.subagent_run import SubagentRun
+from app.models.tool import AgentTool, Tool
 from app.services.llm.client_registry import get_provider_spec, resolve_api_protocol
 from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.llm.utils import get_model_api_key
 from app.services.media_ai_io import MediaAIError
 from app.services.tool_config import get_tenant_tool_config
 from app.services.model_capabilities import MEDIA_MODEL_DEFAULTS, model_modalities, model_purposes
+from app.services.turn_tool_settings import current_tool_settings
 
 
 def media_model_slot(tool: str, args: dict) -> tuple[str, str]:
@@ -88,7 +90,7 @@ def model_connection(model: LLMModel) -> dict:
 
 async def resolve_media_model(state, effective_config: dict) -> dict:
     """Explicit > same-purpose session selection > resolved tool/company default."""
-    from app.services.media_model_migration import materialize_legacy_config, restore_legacy_override
+    from app.services.media_model_migration import LEGACY_KEYS, materialize_legacy_config, restore_legacy_override
 
     slot, purpose = media_model_slot(state.tool_name, state.arguments)
     async with async_session() as db:
@@ -100,20 +102,35 @@ async def resolve_media_model(state, effective_config: dict) -> dict:
         if not model_id:
             model_id = (previous.get("config") or {}).get("model_id")
         config = dict(effective_config)
+        scope = current_tool_settings(state.agent_id)
+        reference = scope.legacy_media_references.get(state.tool_name) if scope else None
+        if scope and not reference and any(key in config for key in LEGACY_KEYS):
+            reference = "company"
+        if not scope and any(key in config for key in LEGACY_KEYS):
+            assignment = await db.scalar(select(AgentTool).join(Tool, Tool.id == AgentTool.tool_id).where(
+                AgentTool.agent_id == agent.id, Tool.name == state.tool_name,
+            ))
+            reference = (f"assignment:{assignment.id}" if assignment and any(
+                key in (assignment.config or {}) for key in LEGACY_KEYS
+            ) else "company")
         if not model_id and previous.get("connection_ref"):
             config = json.loads(decrypt_data(previous["connection_ref"], get_settings().SECRET_KEY))
         if not model_id:
             config = await restore_legacy_override(db, agent.tenant_id, config, slot)
         # Published legacy scenes remain immutable. Their old effective connection
         # is materialized into a tenant model, rather than overriding its secret.
-        if not model_id and config.get("api_key"):
-            config = await materialize_legacy_config(db, agent.tenant_id, config)
+        if not model_id and (config.get("api_key") or reference):
+            config = await materialize_legacy_config(
+                db, agent.tenant_id, config, reference=reference, required_slot=slot,
+            )
         if not model_id:
             model_id = config.get(slot)
         if not model_id:
             defaults = await get_tenant_tool_config(db, agent.tenant_id, "read_media")
             if defaults.get("api_key"):
-                defaults = await materialize_legacy_config(db, agent.tenant_id, defaults)
+                defaults = await materialize_legacy_config(
+                    db, agent.tenant_id, defaults, reference="company", required_slot=slot,
+                )
             model_id = defaults.get(slot)
         if not model_id:
             raise MediaAIError("notConfigured")
