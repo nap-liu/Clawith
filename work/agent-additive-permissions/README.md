@@ -1,5 +1,8 @@
 # Agent additive permissions iteration
 
+> 发布状态：本任务源码已进入公司主线并完成应用切换，见
+> [2026-09-10 发布记录](RELEASE-RESULT.md)。下面各阶段的“尚未发布”等描述属于历史记录。
+
 - Baseline: yybpc/company/main, `0cc8c01c1eb39a8c17f67f6333dbf701369aa677`.
 - Branch: `feat/agent-additive-permissions`.
 - Task worktree, relative to the original repository: `.worktrees/agent-additive-permissions`.
