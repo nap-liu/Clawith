@@ -79,15 +79,13 @@ def _access_ui_redirect(page: PublishedPage, request: Request, denied: bool = Fa
     params = {
         "short_id": page.short_id,
         "return_to": return_url,
+        "auto_login": "1",
     }
     if page.tenant_id:
         params["tenant_id"] = str(page.tenant_id)
-    automatic_login = (request.query_params.get("auto_login") or "").lower() in {"1", "true"}
-    if automatic_login:
-        params["auto_login"] = "1"
-        requested_sso = request.query_params.get("sso")
-        if requested_sso:
-            params["sso"] = requested_sso
+    requested_sso = request.query_params.get("sso")
+    if requested_sso:
+        params["sso"] = requested_sso
     if denied:
         params["denied"] = "1"
     return RedirectResponse(f"/published-page-access?{urlencode(params)}", status_code=302)

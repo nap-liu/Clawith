@@ -27,3 +27,23 @@ export function resolveLoginTenantId(
 ): string {
     return (requestedTenantId || '').trim() || (domainTenantId || '').trim();
 }
+
+/** Preserve the login context through both missing credentials and API 401s. */
+export function buildLoginUrl(href: string): string {
+    const current = new URL(href);
+    if (current.pathname === '/login') return `/login${current.search}`;
+
+    const login = new URLSearchParams({ return_to: href });
+    if (current.pathname === '/published-page-access') {
+        const params = current.searchParams;
+        const shortId = params.get('short_id');
+        const returnTo = safeLoginReturnTo(params.get('return_to'))
+            || (shortId ? `/p/${encodeURIComponent(shortId)}` : '/');
+        login.set('return_to', returnTo);
+        for (const key of ['tenant_id', 'auto_login', 'sso']) {
+            const value = params.get(key);
+            if (value) login.set(key, value);
+        }
+    }
+    return `/login?${login}`;
+}

@@ -670,6 +670,7 @@ async def test_seeded_publish_page_guidance_reaches_actual_llm_tool_output():
     # so give it the same default tool binding that provisioning would create.
     async with async_session() as db:
         publish_tool_row = await db.scalar(select(Tool).where(Tool.name == "publish_page"))
+        assert "SSO starts automatically when login is required" in publish_tool_row.description
         assignment = await db.scalar(select(AgentTool).where(
             AgentTool.agent_id == agent_id,
             AgentTool.tool_id == publish_tool_row.id,
@@ -682,6 +683,7 @@ async def test_seeded_publish_page_guidance_reaches_actual_llm_tool_output():
     publish_tool = next(tool for tool in visible_tools if tool["function"]["name"] == "publish_page")
     description = publish_tool["function"]["description"]
     assert "Non-public pages receive the platform watermark automatically" in description
+    assert "SSO starts automatically when login is required" in description
 
 
 async def test_agent_page_list_includes_management_links():

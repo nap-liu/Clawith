@@ -89,6 +89,30 @@ try {
         '/login?return_to=http%3A%2F%2Ftest%2Fagents%2Fagent-1',
     ]);
 
+    const { buildLoginUrl } = await server.ssrLoadModule('/src/utils/loginReturn.ts');
+    const reportUrl = 'https://reports.example/p/report-1?filter=weekly#chart';
+    const accessQuery = new URLSearchParams({
+        short_id: 'report-1', tenant_id: 'report-tenant', auto_login: '1',
+        sso: 'oauth2', return_to: reportUrl,
+    });
+    window.location.href = `http://test/published-page-access?${accessQuery}`;
+    window.location.pathname = '/published-page-access';
+    const missingCredentialsLogin = buildLoginUrl(window.location.href);
+    storage.set('token', 'expired-report-token');
+    await assert.rejects(request('/protected'), /Session expired/);
+    assert.equal(redirects.at(-1), missingCredentialsLogin);
+    const login = new URL(redirects.at(-1), 'http://test');
+    assert.equal(login.pathname, '/login');
+    assert.equal(login.searchParams.get('return_to'), reportUrl);
+    assert.equal(login.searchParams.get('tenant_id'), 'report-tenant');
+    assert.equal(login.searchParams.get('auto_login'), '1');
+    assert.equal(login.searchParams.get('sso'), 'oauth2');
+
+    window.location.href = login.href;
+    window.location.pathname = '/login';
+    await assert.rejects(request('/protected'), /Session expired/);
+    assert.equal(redirects.at(-1), missingCredentialsLogin);
+
     console.log('auth logout tests passed');
 } finally {
     await server.close();

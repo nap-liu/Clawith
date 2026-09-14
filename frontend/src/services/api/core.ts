@@ -1,5 +1,7 @@
 /** Shared HTTP and upload helpers for frontend API services. */
 
+import { buildLoginUrl } from '../../utils/loginReturn';
+
 const API_BASE = "/api";
 
 export async function clearAuthCredentials(): Promise<void> {
@@ -50,11 +52,7 @@ async function request<T>(
       behavior.redirectOnUnauthorized !== false
     ) {
       void clearAuthCredentials();
-      const onLoginPage = window.location.pathname === "/login";
-      const loginParams = onLoginPage
-        ? ""
-        : `?${new URLSearchParams({ return_to: window.location.href })}`;
-      window.location.replace(`/login${loginParams}`);
+      window.location.replace(buildLoginUrl(window.location.href));
       throw new Error("Session expired");
     }
     const bodyText = await res.text();

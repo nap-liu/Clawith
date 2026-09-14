@@ -192,8 +192,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Published at: {format_datetime_for_agent(publication_time, timezone_name) or 'not recorded'}\n\n"
         f"Access: {effective_access_mode}.\n"
         f"Platform watermark: enabled automatically ({'anonymous visitor ID and access time' if effective_access_mode == 'public' else 'signed-in user identity'}).\n"
-        "Automatic SSO: off by default; append ?auto_login=1 only when explicitly requested, "
-        "and optionally append &sso=<provider_type>."
+        "Automatic SSO: starts when login is required; optionally append ?sso=<provider_type>."
         f"{url_note}"
     )
 

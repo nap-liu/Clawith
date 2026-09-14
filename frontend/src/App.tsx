@@ -328,7 +328,9 @@ export default function App() {
       window.history.replaceState({}, "", cleanUrl);
     }
 
-    if (isH5CodeExchange) {
+    // Reports use their own cookie and server-side access checks. Preserve URL
+    // token handling above, but do not let a stale platform token interrupt them.
+    if (isH5CodeExchange || isPublishedPageRoute) {
       setLoading(false);
       return;
     }
