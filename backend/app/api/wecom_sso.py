@@ -54,16 +54,16 @@ async def wecom_callback(
     # 2. Extract user info and login/register via RegistrationService
     try:
         auth_provider = WeComAuthProvider(provider=provider, config=provider.config or {})
-        
+
         token_data = await auth_provider.exchange_code_for_token(code)
         access_token_str = token_data.get("access_token")
         if not access_token_str:
             return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
-            
+
         user_info = await auth_provider.get_user_info(access_token_str)
         if not user_info.provider_user_id:
             return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
-            
+
         # Find or Create User (handles Identity and OrgMember linking)
         user, _is_new = await auth_provider.find_or_create_user(
             db, user_info, tenant_id=tenant_id or provider.tenant_id
