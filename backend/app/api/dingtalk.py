@@ -421,6 +421,7 @@ async def process_dingtalk_message(
     conversation_title: str = "",
     channel_reactions=None,
     quoted_message: dict | None = None,
+    prepared_sender=None,
 ):
     from app.api import dingtalk_message_processing as _message_processing
 
@@ -445,6 +446,7 @@ async def process_dingtalk_message(
         conversation_title=conversation_title,
         channel_reactions=channel_reactions,
         quoted_message=quoted_message,
+        prepared_sender=prepared_sender,
     )
 
 

@@ -12,6 +12,8 @@ from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
+from app.services.group_policy import group_ingress_allowed
+from app.services.group_policy_sender import resolve_ingress_user
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_commands import is_channel_command
@@ -292,6 +294,13 @@ async def discord_interaction_webhook(
         channel_id = body.get("channel_id", "")
         # Discord: guild interactions are group chats, DM interactions are P2P
         _is_group_discord = bool(body.get("guild_id"))
+        channel_data = body.get("channel") or {}
+        group_id = channel_data.get("parent_id") if channel_data.get("type") in {10, 11, 12} else channel_id
+        await db.commit()
+        if not await group_ingress_allowed(agent_id, "discord", group_id, is_group=_is_group_discord,
+                                           conversation_ref=f"discord_{channel_id}", sender_id=sender_id,
+                                           sender_name=(body.get("member", {}).get("user") or body.get("user") or {}).get("global_name", "")):
+            return Response(status_code=403)
         conv_id = f"discord_{channel_id}" if channel_id else f"discord_dm_{sender_id}"
 
         logger.info(f"[Discord] /{command_name} from {sender_id}: {user_text[:80]}")
@@ -386,13 +395,12 @@ async def discord_interaction_webhook(
                     ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
                     # Find-or-create platform user for this Discord sender via unified service
-                    from app.services.channel_user_service import channel_user_service
 
                     _discord_username = body.get("member", {}).get("user", {}).get("username") or body.get("user", {}).get("username", "")
                     _display = _discord_username or f"Discord User {sender_id[:8]}"
                     _extra_info = {"name": _display}
 
-                    _platform_user = await channel_user_service.resolve_channel_user(
+                    _platform_user = await resolve_ingress_user(
                         db=bg_db,
                         agent=agent_obj,
                         channel_type="discord",

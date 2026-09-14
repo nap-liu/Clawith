@@ -2,6 +2,7 @@
 
 import app.models.activity_log  # noqa: F401
 import app.models.agent  # noqa: F401
+import app.models.agent_group  # noqa: F401
 import app.models.agent_credential  # noqa: F401
 import app.models.audit  # noqa: F401
 import app.models.channel_config  # noqa: F401

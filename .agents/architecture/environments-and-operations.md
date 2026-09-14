@@ -32,6 +32,11 @@ docker run --rm --entrypoint python \
 - `python -m app.scripts.bootstrap_db` and online Alembic CLI `upgrade head(s)`
   share the schema boundary in `alembic/env.py`; the container entrypoint calls
   the former. `app.models.registry` is the complete metadata import graph.
+- The asyncpg migration connection sets `lock_timeout=5s` and
+  `statement_timeout=60s` through `server_settings`, covering the initial
+  bootstrap advisory lock as well as DDL. It does not rely on libpq PGOPTIONS.
+  A lock timeout aborts migration without suppressing the failure or starting
+  application roles against an unverified schema.
 - A truly empty database creates current metadata and guards, then stamps heads
   in one transaction. A PostgreSQL session advisory lock serializes bootstrap
   across concurrent-index migration commits. Versioned databases run upgrades

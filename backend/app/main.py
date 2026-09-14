@@ -444,6 +444,7 @@ from app.api.teams import router as teams_router
 from app.api.triggers import router as triggers_router
 from app.api.focus import router as focus_router
 from app.api.scenes import router as scenes_router
+from app.api.group_policy import router as group_policy_router
 
 from app.api.atlassian import router as atlassian_router
 
@@ -513,6 +514,7 @@ app.include_router(atlassian_router, prefix=settings.API_PREFIX)
 app.include_router(triggers_router)
 app.include_router(focus_router, prefix=settings.API_PREFIX)
 app.include_router(scenes_router, prefix=settings.API_PREFIX)
+app.include_router(group_policy_router, prefix=settings.API_PREFIX)
 app.include_router(chat_sessions_router)
 app.include_router(notification_router, prefix=settings.API_PREFIX)
 app.include_router(webhooks_router)  # Public endpoint, no API prefix

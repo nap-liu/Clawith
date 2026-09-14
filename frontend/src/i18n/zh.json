@@ -1,4 +1,79 @@
 {
+  "unsavedChanges": {
+    "title": "放弃未保存修改？",
+    "message": "当前有未保存的修改，是否离开？",
+    "continue": "继续"
+  },
+  "groupPolicy": {
+    "description": "按群管理成员的对话权限，每个群可配置多条策略。",
+    "groups": "群列表",
+    "save": "保存",
+    "saving": "保存中…",
+    "saved": "群策略已保存",
+    "channel": "通道",
+    "allChannels": "全部通道",
+    "search": "搜索群名称",
+    "loadMore": "加载更多",
+    "loading": "加载中…",
+    "clear": "清空选择",
+    "noGroups": "暂无可用的群聊",
+    "noMatches": "没有匹配的群",
+    "discovery": "选择已有群聊，管理该群的成员策略。",
+    "effective": "保存后对新收到的群消息生效。私聊、已经接收的任务和主动通知不受影响。",
+    "remove": "移除",
+    "removeNamed": "删除 {{name}}",
+    "unavailableLabel": "通道已失效",
+    "unavailable": "群或通道已不可用，请重新选择。",
+    "forbidden": "需要数字员工管理权限。",
+    "conflict": "配置已被其他人修改，请重新加载后再编辑。",
+    "reload": "重新加载",
+    "loadError": "加载失败，请重试。",
+    "saveError": "操作失败，请重试。",
+    "unsaved": "当前群的策略有未保存修改，是否放弃修改并离开？",
+    "channels": {
+      "feishu": "飞书",
+      "dingtalk": "钉钉",
+      "wecom": "企业微信",
+      "slack": "Slack",
+      "discord": "Discord",
+      "teams": "Microsoft Teams"
+    },
+    "groupCount": "{{count}} 个群",
+    "ruleCount": "{{count}} 条策略",
+    "enabledCount": "{{count}} 条已启用",
+    "unnamedGroup": "未获取群名称",
+    "unnamedMember": "未获取成员名称",
+    "selectGroup": "选择一个群，管理成员策略",
+    "semantics": "禁止策略优先。存在已启用的允许策略时，仅允许命中名单的成员；否则沿用现有对话权限。",
+    "memberDiscovery": "从组织架构选择成员，策略按成员绑定的通道账号匹配群消息。",
+    "noRules": "尚未配置策略，群成员沿用现有对话权限。",
+    "addRule": "新增策略",
+    "ruleName": "策略名称",
+    "ruleNameNumber": "策略名称 {{count}}",
+    "defaultName": "成员策略 {{count}}",
+    "action": "处理方式",
+    "effects": {
+      "allow": "允许处理",
+      "deny": "禁止处理"
+    },
+    "enabled": "已启用",
+    "disabled": "已停用",
+    "toggleRule": "启停 {{name}}",
+    "ruleAction": "{{name}} 的处理方式",
+    "memberScope": "适用成员",
+    "specificMembers": "指定成员",
+    "allMembers": "全部成员",
+    "ruleScope": "{{name}} 的适用成员",
+    "ruleMembers": "{{name}} 的成员名单",
+    "selectMembers": "选择成员",
+    "selectedMembers": "已选择 {{count}} 位成员",
+    "searchMembers": "搜索成员姓名",
+    "noMembers": "暂无已识别的群成员",
+    "chooseMembers": "请选择至少一位成员。",
+    "invalidRule": "请填写策略名称并选择适用成员。",
+    "invalidMembers": "部分成员已不可用，请重新选择。",
+    "legacyMembers": "以下已选成员尚未关联组织身份，原有策略仍保留；可移除后从组织架构重新选择。"
+  },
   "openapi": {
     "viewCredentials": "查看凭据",
     "title": "OpenAPI 应用",
@@ -2207,6 +2282,7 @@
       "pending": "待处理"
     },
     "tabs": {
+      "groupPolicy": "群策略",
       "navigation": "数字员工设置分区",
       "status": "状态",
       "tasks": "任务",
@@ -5622,5 +5698,5 @@
     "resetConfirm": "清除",
     "saving": "保存中…",
     "saveError": "权限保存失败，请刷新后重试。"
-}
+  }
 }

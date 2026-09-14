@@ -1,4 +1,79 @@
 {
+  "unsavedChanges": {
+    "title": "Discard unsaved changes?",
+    "message": "You have unsaved changes. Leave this page?",
+    "continue": "Continue"
+  },
+  "groupPolicy": {
+    "description": "Manage member access by group, with multiple policies for each group.",
+    "groups": "Groups",
+    "save": "Save",
+    "saving": "Saving…",
+    "saved": "Group policy saved",
+    "channel": "Channel",
+    "allChannels": "All channels",
+    "search": "Search group names",
+    "loadMore": "Load more",
+    "loading": "Loading…",
+    "clear": "Clear selection",
+    "noGroups": "No group conversations available",
+    "noMatches": "No matching groups",
+    "discovery": "Select an existing group conversation to manage its member policies.",
+    "effective": "Applies to new group messages after saving. Private chats, accepted work and proactive notifications are unaffected.",
+    "remove": "Remove",
+    "removeNamed": "Delete {{name}}",
+    "unavailableLabel": "Channel unavailable",
+    "unavailable": "The group or channel is unavailable. Select it again.",
+    "forbidden": "Agent management permission is required.",
+    "conflict": "Someone else changed this policy. Reload before editing.",
+    "reload": "Reload",
+    "loadError": "Could not load. Please try again.",
+    "saveError": "Could not complete the action. Please try again.",
+    "unsaved": "This group has unsaved policy changes. Discard changes and leave?",
+    "channels": {
+      "feishu": "Feishu",
+      "dingtalk": "DingTalk",
+      "wecom": "WeCom",
+      "slack": "Slack",
+      "discord": "Discord",
+      "teams": "Microsoft Teams"
+    },
+    "groupCount": "{{count}} groups",
+    "ruleCount": "{{count}} policies",
+    "enabledCount": "{{count}} enabled",
+    "unnamedGroup": "Group name unavailable",
+    "unnamedMember": "Member name unavailable",
+    "selectGroup": "Select a group to manage member policies",
+    "semantics": "Deny policies take priority. If any allow policy is enabled, only listed members may proceed; otherwise existing conversation permissions apply.",
+    "memberDiscovery": "Select members from the organization directory. Policies match group messages using their linked channel accounts.",
+    "noRules": "No policies configured. Existing conversation permissions apply.",
+    "addRule": "Add policy",
+    "ruleName": "Policy name",
+    "ruleNameNumber": "Policy name {{count}}",
+    "defaultName": "Member policy {{count}}",
+    "action": "Action",
+    "effects": {
+      "allow": "Allow processing",
+      "deny": "Deny processing"
+    },
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "toggleRule": "Enable or disable {{name}}",
+    "ruleAction": "Action for {{name}}",
+    "memberScope": "Members",
+    "specificMembers": "Selected members",
+    "allMembers": "All members",
+    "ruleScope": "Member scope for {{name}}",
+    "ruleMembers": "Members for {{name}}",
+    "selectMembers": "Select members",
+    "selectedMembers": "{{count}} members selected",
+    "searchMembers": "Search member names",
+    "noMembers": "No group members identified yet",
+    "chooseMembers": "Select at least one member.",
+    "invalidRule": "Enter a policy name and select members.",
+    "invalidMembers": "Some members are no longer available. Select again.",
+    "legacyMembers": "These previously selected members have no linked organization identity. Their rules are retained; remove them to select replacements from the directory."
+  },
   "openapi": {
     "viewCredentials": "View credentials",
     "title": "OpenAPI applications",
@@ -2246,6 +2321,7 @@
       "pending": "Pending"
     },
     "tabs": {
+      "groupPolicy": "Group policies",
       "navigation": "Digital employee settings sections",
       "status": "Status",
       "tasks": "Tasks",
@@ -5556,5 +5632,5 @@
     "resetConfirm": "Clear",
     "saving": "Saving…",
     "saveError": "Could not save permissions. Refresh and try again."
-}
+  }
 }

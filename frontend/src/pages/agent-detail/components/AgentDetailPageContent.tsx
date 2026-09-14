@@ -19,6 +19,7 @@ import ApprovalsTab from '../tabs/ApprovalsTab';
 import MindTab from '../tabs/MindTab';
 import SceneConfigTab from '../tabs/SceneConfigTab';
 import SettingsTab from '../tabs/SettingsTab';
+import GroupPolicyTab from '../tabs/GroupPolicyTab';
 import SkillsTab from '../tabs/SkillsTab';
 import ToolsTab from '../tabs/ToolsTab';
 import AccessPermissionsPanel from './AccessPermissionsPanel';
@@ -246,12 +247,13 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                     <div className="tabs" role="tablist" aria-label={t('agent.tabs.navigation')}>
                         {AGENT_DETAIL_TABS.filter((tab) => {
                             if (['workspace', 'chat'].includes(tab)) return false;
+                            if (tab === 'groupPolicy' && !canManage) return false;
                             if (tab === 'scenes' && (!canManage || !agent.scene_config_enabled)) return false;
                             if (agent.access_level === 'use') {
                                 if (tab === 'settings' || tab === 'approvals') return false;
                             }
                             if (agent.agent_type === 'openclaw') {
-                                return ['status', 'relationships', 'chat', 'activityLog', 'settings'].includes(tab);
+                                return ['status', 'relationships', 'chat', 'activityLog', 'settings', 'groupPolicy'].includes(tab);
                             }
                             return true;
                         }).map((tab) => (
@@ -275,6 +277,7 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                 )}
 
                 {activeTab === 'status' && <StatusTabContent {...(props as any)} formatTokens={formatTokens} />}
+                {activeTab === 'groupPolicy' && id && canManage && <GroupPolicyTab key={id} agentId={id} onDirtyChange={props.setGroupPolicyDirty} />}
 
                 {activeTab === 'aware' && <AwareTabContent {...(props as any)} />}
 

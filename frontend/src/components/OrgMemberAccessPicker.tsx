@@ -89,6 +89,9 @@ type DirectoryMembersResponse = {
 };
 
 type Props = {
+    title?: string;
+    description?: string;
+    confirmLabel?: string;
     open: boolean;
     agentId: string;
     directoryBaseUrl?: string;
@@ -123,6 +126,9 @@ function initials(name: string) {
 }
 
 export default function OrgMemberAccessPicker({
+    title,
+    description,
+    confirmLabel,
     open,
     agentId,
     directoryBaseUrl,
@@ -135,8 +141,8 @@ export default function OrgMemberAccessPicker({
 }: Props) {
     const { t } = useTranslation();
     const labels = {
-        title: t(singleSelect ? 'accessPicker.executionTitle' : 'accessPicker.title'),
-        subtitle: t(singleSelect ? 'accessPicker.executionSubtitle' : 'accessPicker.subtitle'),
+        title: title || t(singleSelect ? 'accessPicker.executionTitle' : 'accessPicker.title'),
+        subtitle: description || t(singleSelect ? 'accessPicker.executionSubtitle' : 'accessPicker.subtitle'),
         search: t('accessPicker.search'),
         organization: t('accessPicker.organization'),
         allMembers: t('accessPicker.allMembers'),
@@ -157,7 +163,7 @@ export default function OrgMemberAccessPicker({
         use: t('accessPicker.use'),
         manage: t('accessPicker.manage'),
         cancel: t('common.cancel'),
-        save: t(singleSelect ? 'accessPicker.confirmSelection' : 'accessPicker.save'),
+        save: confirmLabel || t(singleSelect ? 'accessPicker.confirmSelection' : 'accessPicker.save'),
         saving: t('common.saving'),
         noDepartments: t('accessPicker.noDepartments'),
         noMembers: t('accessPicker.noMembers'),

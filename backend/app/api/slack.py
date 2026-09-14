@@ -15,6 +15,8 @@ from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
+from app.services.group_policy import group_ingress_allowed
+from app.services.group_policy_sender import resolve_ingress_user
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.chat_attachments import attachment_from_workspace_path
@@ -261,6 +263,9 @@ async def slack_event_webhook(
     sender_id = event.get("user", "")
     # Slack channel_id starting with 'D' = DM, 'C'/'G' = group/channel
     _is_group_slack = bool(channel_id) and not channel_id.startswith("D")
+    await db.commit()
+    if not await group_ingress_allowed(agent_id, "slack", channel_id, is_group=_is_group_slack, sender_id=sender_id):
+        return {"ok": True}
     conv_id = f"slack_{channel_id}" if channel_id else f"slack_dm_{sender_id}"
 
     # Early-return for channel commands (/new, /reset):
@@ -332,7 +337,6 @@ async def slack_event_webhook(
     ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
     # Find-or-create platform user for this Slack sender via unified service
-    from app.services.channel_user_service import channel_user_service
     from app.models.agent import Agent as AgentModel
     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
     agent_obj = agent_r.scalar_one_or_none()
@@ -370,7 +374,7 @@ async def slack_event_webhook(
         "email": _slack_email,
         "avatar_url": _slack_avatar,
     }
-    platform_user = await channel_user_service.resolve_channel_user(
+    platform_user = await resolve_ingress_user(
         db=db,
         agent=agent_obj,
         channel_type="slack",

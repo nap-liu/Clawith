@@ -67,7 +67,7 @@ async def session_target_identity(db, agent: Agent, session: ChatSession) -> dic
     if session.project_id or session.source_channel in PLATFORM_CHANNELS:
         return identity
     route = str(session.external_conv_id or "")
-    if not route or "__archived_" in route:
+    if not route or "__archived_" in route or (session.is_group and "__control_" in route):
         return None
     config_type = "microsoft_teams" if session.source_channel == "teams" else session.source_channel
     config = await db.scalar(select(ChannelConfig).where(
@@ -109,7 +109,9 @@ async def current_target_session(db, agent: Agent, identity: dict, *, viewer: Us
     return session
 
 
-async def conversation_options(db, agent: Agent, viewer: User, *, kind="all", q="", channel=None, offset=0, limit=50):
+def conversation_candidates(agent: Agent, viewer: User, *, kind="all", channel=None,
+                            channels=None, include_projects=True):
+    """Shared authorized existing-conversation source, before projection/paging."""
     project_member = exists(select(ProjectMemberSnapshot.id).join(Project).where(
         ProjectMemberSnapshot.project_id == ChatSession.project_id,
         ProjectMemberSnapshot.agent_id == agent.id,
@@ -123,21 +125,37 @@ async def conversation_options(db, agent: Agent, viewer: User, *, kind="all", q=
                  or_(ChatSession.is_group.is_(True), ChatSession.agent_id == agent.id))),
         ChatSession.source_channel.notin_(INTERNAL_CHANNELS),
         or_(ChatSession.external_conv_id.is_(None), ~ChatSession.external_conv_id.contains("__archived_", autoescape=True)),
+        or_(ChatSession.is_group.is_(False), ChatSession.external_conv_id.is_(None),
+            ~ChatSession.external_conv_id.contains("__control_", autoescape=True)),
+        ChatSession.context_terminated_reason.is_(None),
         or_(ChatSession.is_group.is_(True), and_(User.tenant_id == agent.tenant_id, User.is_active.is_(True))),
     ]
     if kind != "all":
         filters.append(ChatSession.is_group.is_(kind == "group"))
     if channel:
         filters.append(ChatSession.source_channel == channel)
+    if channels is not None:
+        filters.append(ChatSession.source_channel.in_(channels))
+    if not include_projects:
+        filters.append(ChatSession.project_id.is_(None))
+    return select(ChatSession.id.label("id"), label.label("label")).outerjoin(
+        User, ChatSession.user_id == User.id,
+    ).where(*filters)
+
+
+async def conversation_options(db, agent: Agent, viewer: User, *, kind="all", q="", channel=None,
+                               offset=0, limit=50, channels=None, include_projects=True):
     # Rank before search/pagination: an old title may not promote a historical session.
-    ranked = select(ChatSession.id.label("id"), label.label("label"), func.row_number().over(
+    ranked = conversation_candidates(agent, viewer, kind=kind, channel=channel,
+        channels=channels, include_projects=include_projects).add_columns(func.row_number().over(
         partition_by=(ChatSession.source_channel, ChatSession.project_id, ChatSession.is_group,
                       ChatSession.user_id, ChatSession.external_conv_id),
         order_by=(ChatSession.created_at.desc(), ChatSession.id.desc()),
-    ).label("position")).outerjoin(User, ChatSession.user_id == User.id).where(*filters).subquery()
+    ).label("position")).subquery()
     query = select(ChatSession, ranked.c.label).join(ranked, ranked.c.id == ChatSession.id).where(ranked.c.position == 1)
     if q.strip():
         query = query.where(ranked.c.label.icontains(q.strip(), autoescape=True))
+    total = await db.scalar(select(func.count()).select_from(query.subquery()))
     rows = (await db.execute(query.order_by(ranked.c.label, ChatSession.id).offset(offset).limit(limit + 1))).all()
     items = []
     for session, name in rows[:limit]:
@@ -150,4 +168,4 @@ async def conversation_options(db, agent: Agent, viewer: User, *, kind="all", q=
             "current_session_id": str(session.id),
             "available": not bool(session.context_terminated_reason),
         })
-    return {"items": items, "next_offset": offset + limit if len(rows) > limit else None}
+    return {"items": items, "total": total, "next_offset": offset + limit if len(rows) > limit else None}

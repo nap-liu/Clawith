@@ -8,6 +8,8 @@ import uuid
 from loguru import logger
 
 from app.services.channel_dispatch import ChannelReactions
+from app.services.group_policy import group_ingress_allowed
+from app.services.group_policy_sender import current_sender
 
 
 def _stream_facade():
@@ -136,6 +138,12 @@ class DingTalkStreamRunnerMixin:
 
                                 if await _check_message_dedup(_mid):
                                     return ""
+                                if not await group_ingress_allowed(agent_id, "dingtalk", _cid,
+                                    is_group=_ctype == "2", name=_title, sender_id=_sid or _ssid,
+                                    sender_name=_nick, sender_type="sender_id" if _sid else "staff_id",
+                                    sender_info={"staff_id": _ssid}):
+                                    return ""
+                                prepared = current_sender()
                                 quoted_message = None
                                 if not _is_cmd:
                                     quoted_message = await _parse_dingtalk_quoted_message(
@@ -157,6 +165,7 @@ class DingTalkStreamRunnerMixin:
                                     conversation_title=_title,
                                     channel_reactions=_reactions,
                                     quoted_message=quoted_message,
+                                    prepared_sender=prepared,
                                 )
                                 return ""
 
@@ -257,6 +266,12 @@ class DingTalkStreamRunnerMixin:
                     redeliver_pending_confirmation,
                 )
 
+                if not await group_ingress_allowed(agent_id, "dingtalk", conversation_id,
+                    is_group=conversation_type == "2", name=conversation_title,
+                    sender_id=sender_id or sender_staff_id, sender_name=sender_nick,
+                    sender_type="sender_id" if sender_id else "staff_id", sender_info={"staff_id": sender_staff_id}):
+                    return
+                prepared = current_sender()
                 external_conv_id = (
                     f"dingtalk_group_{conversation_id}"
                     if conversation_type == "2"
@@ -307,6 +322,7 @@ class DingTalkStreamRunnerMixin:
                     conversation_title=conversation_title,
                     channel_reactions=channel_reactions,
                     quoted_message=quoted_message,
+                    prepared_sender=prepared,
                 )
 
         class ClawithCardCallbackHandler(dingtalk_stream.CallbackHandler):

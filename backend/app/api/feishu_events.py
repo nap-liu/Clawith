@@ -3,6 +3,7 @@
 from app.api.feishu_routes import *  # noqa: F401,F403
 from app.api.feishu_files import *  # noqa: F401,F403
 from app.api.feishu_turn import *  # noqa: F401,F403
+from app.services.group_policy import group_ingress_allowed
 
 async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession):
     """Core logic to process feishu events from both webhook and WS client."""
@@ -34,6 +35,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
         msg_type = message.get("message_type", "text")
         chat_type = message.get("chat_type", "p2p")  # p2p or group
         chat_id = message.get("chat_id", "")
+        await db.commit()
+        if not await group_ingress_allowed(agent_id, "feishu", chat_id, is_group=chat_type == "group", sender_id=sender_open_id,
+                                           sender_info={"external_id": sender_user_id_from_event, "unionid": sender.get("union_id", "")}):
+            return {"code": 0, "msg": "ok"}
         normalized_attachments = []
 
         logger.info(f"[Feishu] Received {msg_type} message, chat_type={chat_type}, open_id={sender_open_id!r}, user_id_from_event={sender_user_id_from_event!r}")
@@ -218,67 +223,19 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
             ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
-            # --- Resolve Feishu sender identity & find/create platform user ---
-            import uuid as _uuid
-            import httpx as _httpx
-
-            sender_name = ""
-            sender_user_id_feishu = sender_user_id_from_event  # tenant-level user_id, pre-filled from event body
-            extra_info: dict | None = {
-                "open_id": sender_open_id,
-                "external_id": sender_user_id_feishu or None,
-            }
-
+            from app.services.group_policy_sender import current_sender, resolve_ingress_user
+            from app.services.feishu_sender import feishu_sender_info
             try:
-                async with _httpx.AsyncClient() as _client:
-                    _tok_resp = await _client.post(
-                        "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal",
-                        json={"app_id": config.app_id, "app_secret": config.app_secret},
-                    )
-                    _app_token = _tok_resp.json().get("app_access_token", "")
-                    if _app_token:
-                        _user_resp = await _client.get(
-                            f"https://open.feishu.cn/open-apis/contact/v3/users/{sender_open_id}",
-                            params={"user_id_type": "open_id"},
-                            headers={"Authorization": f"Bearer {_app_token}"},
-                        )
-                        _user_data = _user_resp.json()
-                        logger.info(f"[Feishu] Sender resolve: code={_user_data.get('code')}, msg={_user_data.get('msg', '')}")
-                        if _user_data.get("code") == 0:
-                            _user_info = _user_data.get("data", {}).get("user", {})
-                            sender_name = _user_info.get("name", "")
-                            sender_user_id_feishu = _user_info.get("user_id", "")
-                            sender_email = _user_info.get("email", "") or _user_info.get("enterprise_email", "")
-                            # Feishu contact API returns 'avatar' as a dict
-                            # (keys: avatar_240, avatar_640, avatar_origin), NOT a plain URL.
-                            # We must extract a string to avoid a DataError when writing to the DB.
-                            _raw_avatar = _user_info.get("avatar")
-                            if isinstance(_raw_avatar, dict):
-                                _avatar_url = (
-                                    _raw_avatar.get("avatar_240")
-                                    or _raw_avatar.get("avatar_640")
-                                    or _raw_avatar.get("avatar_origin")
-                                    or ""
-                                )
-                            else:
-                                _avatar_url = _raw_avatar or ""
-                            extra_info = {
-                                "name": sender_name,
-                                "email": sender_email,
-                                "mobile": _user_info.get("mobile"),
-                                "avatar_url": _avatar_url,
-                                "external_id": _user_info.get("user_id"),
-                                "unionid": _user_info.get("union_id"),
-                                "open_id": sender_open_id,
-                            }
-                            logger.info(f"[Feishu] Resolved sender: {sender_name} (user_id={sender_user_id_feishu})")
-            except Exception as e:
-                logger.error(f"[Feishu] Failed to resolve sender: {e}")
-
-            # Resolve channel user via unified service (uses OrgMember + SSO patterns)
-            from app.services.channel_user_service import channel_user_service
-            try:
-                platform_user = await channel_user_service.resolve_channel_user(
+                prepared = current_sender()
+                if prepared:
+                    extra_info = prepared.info
+                else:
+                    credentials = config.app_id, config.app_secret
+                    await db.commit()
+                    extra_info = await feishu_sender_info(*credentials, sender_open_id, sender_user_id_from_event, sender.get("union_id", ""))
+                sender_name = extra_info.get("name", "")
+                sender_user_id_feishu = extra_info.get("external_id") or ""
+                platform_user = await resolve_ingress_user(
                     db=db,
                     agent=agent_obj,
                     channel_type="feishu",

@@ -18,6 +18,8 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.group_policy import group_ingress_allowed
+from app.services.group_policy_sender import resolve_ingress_user
 from app.services.channel_commands import is_channel_command
 from app.services.channel_dispatch import (
     ChannelReactions,
@@ -93,10 +95,16 @@ class DiscordGatewayManager:
             # Respond to DMs or @mentions
             is_dm = message.guild is None
             is_mention = client.user in message.mentions if message.mentions else False
-
             if not is_dm and not is_mention:
                 return
-
+            is_thread = isinstance(message.channel, discord.Thread)
+            if not await group_ingress_allowed(
+                agent_id, "discord", str(message.channel.parent_id if is_thread else message.channel.id), is_group=not is_dm,
+                name=getattr(message.channel.parent if is_thread else message.channel, "name", ""),
+                conversation_ref=f"discord_{message.channel.id}_{message.author.id}",
+                sender_id=str(message.author.id), sender_name=message.author.display_name,
+            ):
+                return
             # Strip the @mention from the message text
             user_text = message.content
             if is_mention and client.user:
@@ -282,13 +290,12 @@ class DiscordGatewayManager:
                 ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
 
                 # Find or create platform user for this Discord sender via unified service
-                from app.services.channel_user_service import channel_user_service
                 
                 _discord_display_name = message.author.display_name or message.author.name
                 _display = _discord_display_name or f"Discord User {sender_id[:8]}"
                 _extra_info = {"name": _display}
                 
-                _platform_user = await channel_user_service.resolve_channel_user(
+                _platform_user = await resolve_ingress_user(
                     db=db,
                     agent=agent_obj,
                     channel_type="discord",
@@ -310,6 +317,8 @@ class DiscordGatewayManager:
                     external_conv_id=conv_id,
                     source_channel="discord",
                     first_message_title=user_text,
+                    is_group=message.guild is not None,
+                    group_name=getattr(getattr(message.channel, "parent", None) or message.channel, "name", None),
                 )
                 session_conv_id = str(sess.id)
 

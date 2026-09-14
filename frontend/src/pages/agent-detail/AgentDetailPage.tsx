@@ -31,6 +31,7 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
     const queryClient = useQueryClient();
     const currentUser = useAuthStore((state) => state.user);
     const [sceneConfigDirty, setSceneConfigDirty] = useState(false);
+    const [groupPolicyDirty, setGroupPolicyDirty] = useState(false);
     const {
         activeTab,
         isChatRoute,
@@ -38,8 +39,8 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
         setActiveTab,
     } = useAgentDetailRoute({ agentId: id });
     useUnsavedChangesGuard(
-        activeTab === 'scenes' && sceneConfigDirty,
-        '当前有未保存的编辑内容，继续操作将丢失这些修改。是否继续？',
+        (activeTab === 'scenes' && sceneConfigDirty) || (activeTab === 'groupPolicy' && groupPolicyDirty),
+        t(activeTab === 'groupPolicy' ? 'groupPolicy.unsaved' : 'unsavedChanges.message'),
     );
 
     useEffect(() => {
@@ -152,6 +153,7 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
             queryClient={queryClient}
             setActiveTab={setActiveTab}
             setSceneConfigDirty={setSceneConfigDirty}
+            setGroupPolicyDirty={setGroupPolicyDirty}
             overrideModelId={overrideModelId}
             handleModelChange={handleModelChange}
             reasoningEffortOverride={reasoningEffortOverride}

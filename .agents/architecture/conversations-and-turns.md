@@ -306,6 +306,123 @@ primaries nor return a unique-constraint failure.
 
 ## Sessions and identities
 
+### Agent group member policies
+
+Agent settings include a Group policies tab organized by group, with group-name
+search, channel filtering and visible channel labels. Each group owns multiple
+named, independently enabled allow/deny rules. Rules select organization members
+or all members. Enabled denies win; the presence of any enabled allow rule closes
+that group's roster to unmatched members. With no enabled allows, unmatched
+members keep existing conversation permissions. No rule grants identity, Agent,
+tool, or native mention permissions. Unidentifiable senders fail closed whenever
+that group has enabled rules. With no enabled rule for the exact group, admission
+only maintains local stable group/typed participant metadata and delegates identity,
+commands, downloads and dispatch to the ordinary adapter path. It performs no
+provider lookup, canonical User creation or prepared-actor override. A concurrent
+first policy save serializes with that admission through the group row lock.
+
+Group policies and scene activation share `conversation_candidates` as their
+authorized existing-conversation source. Group policy selection restricts it to the
+Agent's connected IM group channels and excludes projects/private chats.
+Its projection resolves stable parent groups before ranking, counting, searching
+and paging, so multiple thread Sessions never create duplicate group choices.
+Parentless historical threads are excluded before totals and pagination.
+Command-control Sessions are not independent group choices; the shared picker
+excludes them along with archived and terminated routes. The group policy UI
+does not use `agent_groups` discovery rows as its directory and does not wait
+for another inbound event. Listing/selecting existing groups is read-only.
+
+Scene target references are revalidated against the current authorized
+conversation, then projected into the stable provider group identity. Before a
+policy is saved, its group and legacy participant references are deterministic virtual values;
+only an explicit save or authenticated ingress materializes their rows. No
+historical Session or message is copied or rewritten. Existing rule IDs survive
+Session reset and ordinary inbound discovery racing the first settings save.
+
+`agent_groups` owns its rule JSON and optimistic revision. Its stable identity is
+Agent, channel, installation scope, and the provider's opaque group reference.
+Names and Session IDs never determine policy ownership. Group references are
+internal: the management UI/API does not expose the native reference or offer
+manual ID registration. Secret rotation preserves scope; a different installation
+starts independent groups with no rules. Tenant ownership is checked separately.
+Teams channel messages use `channelData.channel.id`; Discord threads use their
+parent channel. Exact reply routes stay with transport adapters, following the
+[Teams conversation](https://learn.microsoft.com/en-us/microsoftteams/platform/resources/bot-v3/bot-conversations/bots-conv-channel)
+and [Discord thread](https://docs.discord.com/developers/topics/threads) contracts.
+
+`agent_group_members` records observed participation using typed provider subjects
+within one group. It is not another person directory or a complete provider member
+sync. Each adapter supplies the authenticated sender subject and available display
+name. Existing scoped ChannelUserBinding rows provide canonical names and verified
+aliases; nickname equality never establishes identity. All known aliases participate
+in rule matching, so changing between already-bound subjects cannot evade a deny.
+Provider subjects and internal member references are not displayed to users.
+The UI reuses `OrgMemberAccessPicker` in members-only mode and the standard Agent
+permission directory endpoints, including department browsing, search and paging.
+New selections persist canonical tenant `User.id` values in each rule's `user_ids`;
+members need not have previously spoken in the group. Ingress prepares the complete
+authenticated sender profile and uses the shared channel User resolver, including
+first directory bindings and verified provider aliases, before matching these IDs.
+Legacy alias matching is scoped to the same tenant/provider/channel/installation.
+No directory display name or Session owner establishes identity.
+Legacy `member_ids` rules remain enforceable. Reads project uniquely bound legacy
+selections into organization users without writing; unbound selections remain
+visible/removable until a manager replaces them. Explicit saves normalize selected
+users while retaining unresolved legacy subjects and the full before-state audit.
+The historical participant projection remains only for validating legacy references.
+Resolved participants are still observed when denied; an all-member deny needs no
+identity preparation. Unresolvable/conflicting identities are rejected.
+Available Session group names remain display projections only.
+
+Authenticated Feishu, DingTalk, WeCom, Slack, Discord and Teams ingress converges
+on `group_ingress_allowed` before commands, media downloads, remote quote parsing,
+message triggers and model dispatch. An enabled all-member deny short-circuits;
+other enabled rules consume a complete prepared canonical sender. Feishu contact fields
+augment event IDs, never erase them, and conflicting IDs are refused. DingTalk
+fresh directory claims are gathered before canonical reconciliation. Both adapters
+revalidate configuration after provider waits and before writing identity bindings.
+Identity preparation uses independent transactions and holds no group row lock or
+open database read transaction while waiting for providers. Final admission locks
+the group briefly and rereads its current rules, including edits made during waits.
+Denied inputs may establish verified identity bindings and group/member metadata;
+no ChatSession or ChatMessage is created. Transport
+acknowledgements keep native behavior (Discord slash rejection is HTTP 403).
+
+`PreparedSender` is reused by downstream text/file processing instead of running a
+second identity resolution with different claims. DingTalk Stream prepares within
+the scheduled work, before references/media, and explicitly passes the actor into
+the platform handler. Private chats continue through their ordinary resolver.
+Discord Gateway filters mentions before preparation, marks guild Sessions as groups,
+and binds the verified parent reference; real inbound traffic upgrades legacy rows.
+Historical Discord guild routes cannot bypass confirmation checks as private chats.
+
+Group upserts, member observation and policy saves serialize on the same group
+row in short transactions. Different groups do not share a policy lock. Saves
+validate selected organization members against the Agent's tenant and active users,
+and legacy member references against the group, with manager authority,
+check the expected revision and append AuditLog atomically. Provider waits and
+model loops do not hold these transactions. There is no rejected-message inbox,
+replay worker, generic rule engine or separate execution loop.
+
+Session reset preserves the group reference in validated `im_config` context.
+Confirmations for a known group with no enabled rules retain the ordinary path,
+including after installation configuration removal or rotation. Confirmation
+resumes for restricted groups check the clicking user's canonical identity and legacy scoped bindings, never the
+Session's placeholder owner. Legacy Sessions without a stored group reference resolve the same stable native
+route on read. When a transport's old Session cannot prove the group identity
+(for example an old thread with no parent metadata), confirmation fails closed
+while that channel has enabled rules; no historical metadata is backfilled. Already admitted work and ordinary
+recovery keep their lifecycle. Private chats, project collaboration and proactive
+notifications are outside this inbound gate.
+
+The `group_member_rules` migration supersedes the unpublished Agent-wide roster
+candidate. It archives previous modes/rosters and converts each already-known
+restricted group into an all-member deny rule. There is no longer an Agent-wide
+restriction on future unknown groups: newly discovered groups start with no rules.
+Group/member policy data cannot be downgraded to the old evaluator while any rules
+remain. This conversion must be reviewed as a product semantics change before any
+future production release; this iteration only uses isolated local databases.
+
 Responses uses the existing shared LLM/tool loop with a true SSE adapter. Text and
 tool-argument increments may update the UI while streaming, but only a successful
 terminal response authorizes execution of returned tool calls. Failed, incomplete,

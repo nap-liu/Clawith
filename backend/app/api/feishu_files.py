@@ -87,58 +87,18 @@ async def _handle_feishu_file(
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
 
-        # Resolve sender's Feishu user_id (more stable than open_id)
-        sender_user_id_feishu = sender_user_id_from_event or ""
-        extra_info: dict | None = {
-            "open_id": sender_open_id,
-            "external_id": sender_user_id_feishu or None,
-        }
+        from app.services.group_policy_sender import current_sender, resolve_ingress_user
+        from app.services.feishu_sender import feishu_sender_info
         try:
-            import httpx as _hx
-            async with _hx.AsyncClient() as _fc:
-                _tr = await _fc.post(
-                    "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal",
-                    json={"app_id": config.app_id, "app_secret": config.app_secret},
-                )
-                _at = _tr.json().get("app_access_token", "")
-                if _at:
-                    _ur = await _fc.get(
-                        f"https://open.feishu.cn/open-apis/contact/v3/users/{sender_open_id}",
-                        params={"user_id_type": "open_id"},
-                        headers={"Authorization": f"Bearer {_at}"},
-                    )
-                    _ud = _ur.json()
-                    if _ud.get("code") == 0:
-                        _user_info = _ud.get("data", {}).get("user", {})
-                        sender_user_id_feishu = _user_info.get("user_id", "")
-                        # Feishu contact API returns 'avatar' as a dict
-                        # (keys: avatar_240, avatar_640, avatar_origin), NOT a plain URL.
-                        _raw_avatar = _user_info.get("avatar")
-                        if isinstance(_raw_avatar, dict):
-                            _avatar_url = (
-                                _raw_avatar.get("avatar_240")
-                                or _raw_avatar.get("avatar_640")
-                                or _raw_avatar.get("avatar_origin")
-                                or ""
-                            )
-                        else:
-                            _avatar_url = _raw_avatar or ""
-                        extra_info = {
-                            "name": _user_info.get("name"),
-                            "avatar_url": _avatar_url,
-                            "email": _user_info.get("email"),
-                            "mobile": _user_info.get("mobile"),
-                            "external_id": _user_info.get("user_id"),
-                            "unionid": _user_info.get("union_id"),
-                            "open_id": sender_open_id,
-                        }
-        except Exception:
-            pass
-
-        # Resolve channel user via unified service (uses OrgMember + SSO patterns)
-        from app.services.channel_user_service import channel_user_service
-        try:
-            platform_user = await channel_user_service.resolve_channel_user(
+            prepared = current_sender()
+            if prepared:
+                extra_info = prepared.info
+            else:
+                credentials = config.app_id, config.app_secret
+                await db.commit()
+                extra_info = await feishu_sender_info(*credentials, sender_open_id, sender_user_id_from_event)
+            sender_user_id_feishu = extra_info.get("external_id") or ""
+            platform_user = await resolve_ingress_user(
                 db=db,
                 agent=agent_obj,
                 channel_type="feishu",

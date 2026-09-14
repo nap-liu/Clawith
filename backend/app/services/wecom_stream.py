@@ -14,6 +14,8 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.group_policy import group_ingress_allowed
+from app.services.group_policy_sender import resolve_ingress_user
 from app.services.im_markdown_media import project_agent_images_for_im
 
 
@@ -71,7 +73,6 @@ async def _persist_wecom_stream_control(
     """Persist and deliver one exact WeCom stream control artifact."""
     from app.models.agent import Agent
     from app.services.channel_session import find_or_create_channel_session
-    from app.services.channel_user_service import channel_user_service
     from app.services.im_delivery import (
         IMDeliveryPart,
         IMDeliveryResult,
@@ -90,7 +91,7 @@ async def _persist_wecom_stream_control(
         if agent is None:
             raise RuntimeError("wecom_stream_agent_not_found")
         if sender_id:
-            platform_user = await channel_user_service.resolve_channel_user(
+            platform_user = await resolve_ingress_user(
                 db=db,
                 agent=agent,
                 channel_type="wecom",
@@ -202,6 +203,12 @@ class WeComStreamManager:
                 chat_type = "single"
                 try:
                     body = frame.body or {}
+                    if not await group_ingress_allowed(
+                        agent_id, "wecom", _extract_wecom_chat_id(body),
+                        is_group=_extract_wecom_chat_type(body) in {"group", "groupchat", "group_chat"},
+                        sender_id=_extract_wecom_sender_id(body),
+                    ):
+                        return
                     text_obj = body.get("text", {})
                     user_text = text_obj.get("content", "").strip()
                     if not user_text:
@@ -387,6 +394,12 @@ class WeComStreamManager:
             async def on_image(frame):
                 try:
                     body = frame.body or {}
+                    if not await group_ingress_allowed(
+                        agent_id, "wecom", _extract_wecom_chat_id(body),
+                        is_group=_extract_wecom_chat_type(body) in {"group", "groupchat", "group_chat"},
+                        sender_id=_extract_wecom_sender_id(body),
+                    ):
+                        return
                     sender_id = _extract_wecom_sender_id(body)
                     chat_id = _extract_wecom_chat_id(body)
                     chat_type = _extract_wecom_chat_type(body)
@@ -413,6 +426,12 @@ class WeComStreamManager:
             async def on_file(frame):
                 try:
                     body = frame.body or {}
+                    if not await group_ingress_allowed(
+                        agent_id, "wecom", _extract_wecom_chat_id(body),
+                        is_group=_extract_wecom_chat_type(body) in {"group", "groupchat", "group_chat"},
+                        sender_id=_extract_wecom_sender_id(body),
+                    ):
+                        return
                     sender_id = _extract_wecom_sender_id(body)
                     chat_id = _extract_wecom_chat_id(body)
                     chat_type = _extract_wecom_chat_type(body)
@@ -439,6 +458,12 @@ class WeComStreamManager:
             async def on_enter_chat(frame):
                 try:
                     body = frame.body or {}
+                    if not await group_ingress_allowed(
+                        agent_id, "wecom", _extract_wecom_chat_id(body),
+                        is_group=_extract_wecom_chat_type(body) in {"group", "groupchat", "group_chat"},
+                        sender_id=_extract_wecom_sender_id(body),
+                    ):
+                        return
                     sender_id = _extract_wecom_sender_id(body)
                     chat_id = _extract_wecom_chat_id(body)
                     chat_type = _extract_wecom_chat_type(body)
@@ -581,7 +606,6 @@ async def _process_wecom_stream_message(
     from app.models.agent import Agent as AgentModel
     from app.models.audit import ChatMessage
     from app.services.channel_session import find_or_create_channel_session
-    from app.services.channel_user_service import channel_user_service
     from app.services.channel_llm import _call_agent_llm
     from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 
@@ -598,7 +622,7 @@ async def _process_wecom_stream_message(
         normalized_chat_type = (chat_type or "single").strip().lower()
         conv_id = _build_wecom_conv_id(sender_id, chat_id, normalized_chat_type)
 
-        platform_user = await channel_user_service.resolve_channel_user(
+        platform_user = await resolve_ingress_user(
             db=db,
             agent=agent_obj,
             channel_type="wecom",

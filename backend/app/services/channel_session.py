@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chat_session import ChatSession
 from app.services.session_identity import require_same_tenant_session_user
+from app.services.group_policy import bind_session_group
 
 
 async def find_or_create_channel_session(
@@ -114,4 +115,5 @@ async def find_or_create_channel_session(
             session.group_name = group_name
             session.title = group_name[:40]
 
+    bind_session_group(session)
     return session

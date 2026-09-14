@@ -1,6 +1,7 @@
 """Confirmation suspension, resolution, and loop re-entry."""
 
 from app.services.confirmation_shared import *  # noqa: F401,F403
+from app.services.group_policy import session_group_allowed
 
 
 
@@ -309,6 +310,13 @@ async def resolve_confirmation(
             logger.warning("resolve_confirmation: no matching tool_call row %s", call_id)
             return None
         conversation_id = row.conversation_id
+
+        try:
+            origin_session = await db.get(ChatSession, uuid.UUID(str(conversation_id)))
+        except (ValueError, TypeError):
+            origin_session = None
+        if not await session_group_allowed(db, origin_session, resolving_user_id):
+            return None
 
         # Lock the session row FOR UPDATE so concurrent resolves of the same card serialize:
         # the second blocks here, then (after refresh) re-reads a 'done' row and returns early.

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from app.api import dingtalk as dingtalk_api
 from app.database import async_session, engine
 from app.models.agent import Agent
+from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
 from app.models.identity import IdentityProvider
 from app.models.org import OrgMember
@@ -55,12 +56,14 @@ async def test_conversation_title_persisted_by_message_entry(
         )
         provider = IdentityProvider(
             tenant_id=tenant.id, name="DingTalk", provider_type="dingtalk",
-            is_active=True, config={"app_key": "test-key", "app_secret": "test-secret"},
+            is_active=True, config={"app_key": f"title-{suffix}", "app_secret": "test-secret"},
         )
         db.add_all([user, provider])
         await db.flush()
         agent = Agent(name="Title Agent", creator_id=user.id, tenant_id=tenant.id)
         db.add(agent)
+        await db.flush()
+        db.add(ChannelConfig(agent_id=agent.id, channel_type="dingtalk", app_id=f"title-{suffix}", is_configured=True))
         db.add(OrgMember(
             tenant_id=tenant.id, provider_id=provider.id, external_id=staff_id,
             name=user.display_name, status="active", user_id=user.id,
@@ -91,13 +94,16 @@ async def test_conversation_title_persisted_by_message_entry(
     llm.assert_awaited_once()
 
 
-async def test_stream_handler_passes_conversation_title_to_platform_entry(monkeypatch):
+@pytest.mark.parametrize("allowed", [True, False])
+async def test_stream_handler_passes_conversation_title_to_platform_entry(monkeypatch, allowed):
     """Exercise the registered platform callback, including its scheduled work."""
     manager = stream_service.DingTalkStreamManager()
     manager._main_loop = asyncio.get_running_loop()
     entry = AsyncMock()
     scheduled = []
     callbacks = []
+    admission = AsyncMock(return_value=allowed)
+    monkeypatch.setattr("app.services.dingtalk_stream_runner.group_ingress_allowed", admission)
     monkeypatch.setattr(dingtalk_api, "process_dingtalk_message", entry)
     monkeypatch.setattr(dingtalk_api, "_check_message_dedup", AsyncMock(return_value=False))
     monkeypatch.setattr(stream_service, "_parse_dingtalk_quoted_message", AsyncMock(return_value=None))
@@ -128,6 +134,13 @@ async def test_stream_handler_passes_conversation_title_to_platform_entry(monkey
     assert callbacks == [(dingtalk_stream.AckMessage.STATUS_OK, "ok")]
     assert len(scheduled) == 1
     await scheduled[0]
+    assert admission.await_args.args[1:] == ("dingtalk", "cid_title")
+    assert admission.await_args.kwargs == {"is_group": True, "name": "Real Group Name",
+                                          "sender_id": "staff_title", "sender_name": "Alice", "sender_type": "staff_id",
+                                          "sender_info": {"staff_id": "staff_title"}}
+    if not allowed:
+        entry.assert_not_awaited()
+        return
     entry.assert_awaited_once()
     assert entry.await_args.kwargs["conversation_title"] == "Real Group Name"
     assert entry.await_args.kwargs["conversation_id"] == "cid_title"

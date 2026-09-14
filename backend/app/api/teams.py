@@ -20,6 +20,8 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent as AgentModel
 from app.models.channel_config import ChannelConfig
+from app.services.group_policy import group_ingress_allowed
+from app.services.group_policy_sender import resolve_ingress_user
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_session import find_or_create_channel_session
@@ -414,6 +416,16 @@ async def teams_event_webhook(
             logger.warning(f"Teams: Missing conversation_id or sender_id in activity for agent {agent_id}")
             return {"ok": True}
 
+        await db.commit()
+        if not await group_ingress_allowed(
+            agent_id, "teams", ((activity.get("channelData") or {}).get("channel") or {}).get("id")
+            if activity.get("conversation", {}).get("conversationType") == "channel" else conversation_id,
+            is_group=activity.get("conversation", {}).get("conversationType") in {"groupChat", "channel"},
+            name=activity.get("conversation", {}).get("name", ""),
+            conversation_ref=conversation_id, sender_id=sender_id, sender_name=sender_name,
+        ):
+            return {"ok": True}
+
         logger.info(f"Teams: Message from={sender_id}, conversation={conversation_id}: {user_text[:80]}")
 
         # Load agent (must happen before user resolution for tenant_id)
@@ -423,9 +435,8 @@ async def teams_event_webhook(
         ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
         # Find-or-create platform user for this Teams sender via unified service
-        from app.services.channel_user_service import channel_user_service
         _extra_info = {"name": sender_name}
-        platform_user = await channel_user_service.resolve_channel_user(
+        platform_user = await resolve_ingress_user(
             db=db,
             agent=agent_obj,
             channel_type="teams",
