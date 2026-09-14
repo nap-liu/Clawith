@@ -18,6 +18,7 @@ import OrgMemberIdentitySummary, {
     type DirectorySourceSummary,
 } from './OrgMemberIdentitySummary';
 import Avatar from './ui/Avatar';
+import OrgAccessMemberRow from './OrgAccessMemberRow';
 import './OrgMemberAccessPicker.css';
 
 export type AgentAccessUser = {
@@ -521,8 +522,6 @@ export default function OrgMemberAccessPicker({
     const memberData = membersQuery.data;
     const selectedCount = draftUsers.size;
     const selectedDepartmentCount = draftDepartments.size;
-    const companyAdminCount = requiredUsers.filter(user => user.required_reason === 'company_admin').length;
-    const hasCreator = requiredUsers.some(user => user.required_reason === 'creator');
     const searchResults = departmentSearchQuery.data?.items || [];
 
     return createPortal(
@@ -733,37 +732,23 @@ export default function OrgMemberAccessPicker({
                         <div className="org-access-picker__selected-section-title">{labels.selectedMembers} <span>{selectedCount}</span></div>
                         <div className="org-access-picker__selected-list">
                             {selectedCount > 0 ? Array.from(draftUsers.values()).map(user => (
-                                <div key={user.id} className="org-access-picker__selected-row">
-                                    <Avatar
-                                        className="org-access-picker__avatar"
-                                        src={user.avatar_url}
-                                        name={initials(user.name)}
-                                    />
-                                    <div className="org-access-picker__selected-copy">
-                                        <strong>{[user.name, user.phone_masked].filter(Boolean).join(' · ')}</strong>
-                                        <small>{compactDepartmentPath(user.department_path) || user.email || ''}</small>
-                                        <OrgMemberIdentitySummary
-                                            directorySources={user.directory_sources}
-                                            channelBindings={user.channel_bindings}
-                                        />
-                                    </div>
-                                    {!membersOnly && <select
-                                        value={user.access_level}
-                                        onChange={event => updateLevel(user.id, event.target.value as 'use' | 'manage')}
-                                        aria-label={t('accessPicker.accessLevel', { name: user.name })}
-                                    >
-                                        <option value="use">{labels.use}</option>
-                                        <option value="manage">{labels.manage}</option>
-                                    </select>}
-                                    <button type="button" onClick={() => removeUser(user.id)} aria-label={`${labels.cancel} ${user.name}`}><IconX size={14} /></button>
-                                </div>
+                                <OrgAccessMemberRow
+                                    key={user.id}
+                                    user={user}
+                                    subtitle={compactDepartmentPath(user.department_path) || user.email || ''}
+                                    onLevelChange={membersOnly ? undefined : level => updateLevel(user.id, level)}
+                                    onRemove={() => removeUser(user.id)}
+                                />
                             )) : <div className="org-access-picker__empty">{labels.noMembers}</div>}
                         </div>
                         {!membersOnly && <details className="org-access-picker__required">
                             <summary>{labels.systemManagers} {requiredUsers.length}</summary>
                             <div>
-                                {hasCreator && <span>{labels.creator} · {labels.manage}</span>}
-                                {companyAdminCount > 0 && <span>{labels.companyAdmins} {companyAdminCount} · {labels.manage}</span>}
+                                {requiredUsers.map(user => <OrgAccessMemberRow
+                                    key={user.id}
+                                    user={user}
+                                    subtitle={compactDepartmentPath(user.department_path) || user.email || ''}
+                                />)}
                             </div>
                         </details>}
                     </aside>

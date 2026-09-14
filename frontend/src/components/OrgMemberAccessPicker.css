@@ -457,6 +457,18 @@
     font-size: 11px;
 }
 
+.org-access-picker__readonly-level {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.org-access-picker__required .org-access-picker__selected-copy strong {
+    color: var(--text-primary);
+}
+
 .org-access-picker__required summary {
     cursor: pointer;
 }
@@ -465,7 +477,7 @@
     display: flex;
     flex-direction: column;
     gap: 5px;
-    padding: 8px 0 0 16px;
+    padding: 8px 0 0;
 }
 
 .org-access-picker__pagination {

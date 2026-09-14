@@ -10,8 +10,8 @@ export const AGENT_DETAIL_TABS = [
     'chat',
     'activityLog',
     'approvals',
-    'settings',
     'groupPolicy',
+    'settings',
 ] as const;
 
 export type AgentDetailTab = typeof AGENT_DETAIL_TABS[number];

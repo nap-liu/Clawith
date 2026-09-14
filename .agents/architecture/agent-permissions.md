@@ -101,3 +101,9 @@ REST/MCP parity, concurrent writes, old-data migration and actual browser edits.
 Include default online/bootstrap rejection, bounded lock failure, old REST
 roster changes followed by downgrade refusal, and UI saves preserving explicit
 administrator and inactive-department grants.
+
+The permission editor displays built-in managers in the read-only roster and
+keeps their explicit personal grants separately from editable members. Ordinary
+company/member edits preserve those stored grants without upgrading their level
+to the effective built-in management level. The explicit clear-all action clears
+optional grants while leaving built-in management authority and its roster intact.

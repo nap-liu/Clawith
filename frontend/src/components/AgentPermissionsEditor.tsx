@@ -21,6 +21,7 @@ export type AgentPermissionsValue = {
     company: 'off' | 'use' | 'manage';
     users: AgentAccessUser[];
     departments: AgentAccessDepartment[];
+    builtinUserGrants?: AgentGrant[];
 };
 
 export function agentPermissionsValue(data: {
@@ -30,13 +31,18 @@ export function agentPermissionsValue(data: {
 }): AgentPermissionsValue {
     const users = new Map(data.user_access?.map(user => [user.id, user]));
     const departments = new Map(data.department_access?.map(department => [department.id, department]));
+    const builtinUsers = (data.user_access || []).filter(user => user.is_required);
+    const builtinIds = new Set(builtinUsers.map(user => user.id));
     return {
         company: data.grants.find(grant => grant.scope_type === 'company')?.access_level || 'off',
-        users: data.grants.filter(grant => grant.scope_type === 'user').map(grant => ({
+        builtinUserGrants: data.grants.filter(grant =>
+            grant.scope_type === 'user' && builtinIds.has(grant.scope_id!)),
+        users: [...builtinUsers, ...data.grants.filter(grant =>
+            grant.scope_type === 'user' && !builtinIds.has(grant.scope_id!)).map(grant => ({
             id: grant.scope_id!, name: i18n.t('agentPermissions.unavailableMember'),
             ...users.get(grant.scope_id!),
             access_level: grant.access_level, is_required: false, required_reason: null,
-        })),
+        }))],
         departments: data.grants.filter(grant => grant.scope_type === 'department').map(grant => ({
             id: grant.scope_id!, name: i18n.t('agentPermissions.unavailableDepartment'), path: '',
             ...departments.get(grant.scope_id!),
@@ -49,6 +55,7 @@ export function permissionGrants(value: AgentPermissionsValue): AgentGrant[] {
     const grants: AgentGrant[] = value.company === 'off' ? [] : [{
         scope_type: 'company', scope_id: null, access_level: value.company,
     }];
+    grants.push(...(value.builtinUserGrants || []));
     grants.push(...value.users.filter(user => !user.is_required).map(user => ({
         scope_type: 'user' as const, scope_id: user.id, access_level: user.access_level,
     })));
@@ -76,7 +83,7 @@ export default function AgentPermissionsEditor({
     const [pendingCompany, setPendingCompany] = useState<AgentPermissionsValue['company'] | null>(null);
     const businessUsers = value.users.filter(user => !user.is_required);
     const hasSubjects = value.departments.length > 0 || businessUsers.length > 0;
-    const isPrivate = value.company === 'off' && !hasSubjects;
+    const isPrivate = value.company === 'off' && !hasSubjects && !value.builtinUserGrants?.length;
     const save = async (next: AgentPermissionsValue) => {
         setSaving(true);
         try {
@@ -109,6 +116,7 @@ export default function AgentPermissionsEditor({
         });
         if (confirmed) saveControl({
             company: 'off', departments: [], users: value.users.filter(user => user.is_required),
+            builtinUserGrants: [],
         });
         setConfirming(false);
     };
@@ -197,7 +205,9 @@ export default function AgentPermissionsEditor({
                 directoryBaseUrl={agentId ? undefined : '/agents/permissions/directory'}
                 users={value.users} departments={value.departments}
                 onClose={() => setOpen(false)}
-                onSave={(users, departments) => save({ ...value, users, departments })}
+                onSave={(users, departments) => save({ ...value,
+                    users: [...value.users.filter(user => user.is_required), ...users], departments,
+                })}
             />
         </div>
     );
