@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { IconAlertTriangle, IconLock } from '@tabler/icons-react';
 import { fetchJson } from '../services/api';
-import { isAutomaticLoginRequested, safeLoginReturnTo } from '../utils/loginReturn';
+import { buildLoginUrl, safeLoginReturnTo } from '../utils/loginReturn';
 
 type AccessCheck = {
     allowed: boolean;
@@ -15,9 +15,7 @@ export default function PublishedPageAccess() {
     const [params] = useSearchParams();
     const shortId = params.get('short_id') || '';
     const returnTo = safeLoginReturnTo(params.get('return_to')) || (shortId ? `/p/${shortId}` : '/');
-    const tenantId = params.get('tenant_id') || '';
-    const automaticLogin = isAutomaticLoginRequested(params.get('auto_login'));
-    const requestedSso = params.get('sso') || '';
+    const loginUrl = buildLoginUrl(window.location.href);
     const [access, setAccess] = useState<AccessCheck | null>(null);
     const [error, setError] = useState('');
     const [requesting, setRequesting] = useState(false);
@@ -25,13 +23,7 @@ export default function PublishedPageAccess() {
     useEffect(() => {
         const token = localStorage.getItem('token');
         if (!token) {
-            const login = new URLSearchParams({ return_to: returnTo });
-            if (tenantId) login.set('tenant_id', tenantId);
-            if (automaticLogin) {
-                login.set('auto_login', '1');
-                if (requestedSso) login.set('sso', requestedSso);
-            }
-            window.location.replace(`/login?${login.toString()}`);
+            window.location.replace(loginUrl);
             return;
         }
         fetchJson<AccessCheck>('/pages/session', {
@@ -46,7 +38,7 @@ export default function PublishedPageAccess() {
             }
             setError(e.message || '暂时无法验证访问权限');
         });
-    }, [automaticLogin, requestedSso, returnTo, shortId, tenantId]);
+    }, [loginUrl, returnTo, shortId]);
 
     const requestAccess = async () => {
         setRequesting(true); setError('');

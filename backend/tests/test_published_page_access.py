@@ -87,12 +87,12 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         assert initial.status_code == 302
         assert initial.headers["location"].startswith("/published-page-access?")
         initial_query = parse_qs(urlparse(initial.headers["location"]).query)
-        assert "auto_login" not in initial_query
+        assert initial_query["auto_login"] == ["1"]
 
         selected_only = await client.get(f"/p/{short_id}?sso=dingtalk", follow_redirects=False)
         selected_only_query = parse_qs(urlparse(selected_only.headers["location"]).query)
-        assert "auto_login" not in selected_only_query
-        assert "sso" not in selected_only_query
+        assert selected_only_query["auto_login"] == ["1"]
+        assert selected_only_query["sso"] == ["dingtalk"]
 
         automatic = await client.get(
             f"/p/{short_id}?auto_login=1&sso=dingtalk", follow_redirects=False

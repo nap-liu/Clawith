@@ -227,8 +227,8 @@ BUILTIN_TOOLS_PART_6 = [
             "and use restricted for specified users. Before restricted publishing, use search_page_viewers to obtain "
             "user IDs and pass them in allowed_user_ids. Republishing the same path updates the existing page at the "
             "same URL and preserves its current permissions unless access_mode is explicitly supplied. Non-public pages "
-            "receive the platform watermark automatically. Automatic SSO is opt-in only: append auto_login=1 to the Page URL only "
-            "when the user explicitly requests automatic login; optionally add sso=<provider_type>, otherwise "
+            "receive the platform watermark automatically. SSO starts automatically when login is required; "
+            "optionally add sso=<provider_type> to the Page URL, otherwise "
             "the first enabled SSO provider is used. The result includes the publication actor and exact publication time. "
             "Always give the user both the Page URL and Management URL exactly as returned."
         ),
