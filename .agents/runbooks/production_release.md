@@ -43,6 +43,13 @@ Release, any production inspection or mutation, backup, migration, external
 smoke message, cutover, or rollback. Those checkpoints still require direct
 authorization.
 
+When the user authorizes SSH inspection and provides a host or alias, inspect
+that deployment directly before asking for inventory values. Authorization and
+verified values remain usable throughout the release session. Do not ask the
+user to repeat a registry, digest, or configuration path that can be read from
+the authorized running deployment. Ask only for a remaining decision or an
+unavailable fact after completing the independent preparation work.
+
 Record before GO:
 
 ```text
@@ -145,7 +152,10 @@ build provenance as well as OCI labels: an enclosing checkout can otherwise
 contribute a different `vcs:revision`. Reject such artifacts. For archive builds,
 disable automatic Git discovery and record the archive's source SHA explicitly.
 
-1. Put the full SHA in the backend `COMMIT` build-context file.
+1. Put the full SHA in the backend `COMMIT` build-context file. The runtime
+   version endpoint reads `COMMIT`, not `COMMIT_SHA`; OCI labels alone do not
+   populate it. Verify the exported file before building and `/api/version`
+   from the resulting isolated container before accepting the artifact.
 2. Build backend and frontend together for `linux/amd64` with OCI revision and
    version labels.
 3. Select and record the backend dependency mode described below. Use
@@ -249,6 +259,34 @@ In dependency-refresh mode, inspect and record the resolved packages rather
 than describing their download as an unexpected cache failure.
 
 ## 5. Prepare production while the old release stays live
+
+For an authorized SSH target, locate the actual Compose configuration through
+container labels, rather than assuming that a similarly named file is active.
+Resolve the variables below from the user's authorized target and the first
+command's output; keep concrete values in the private release evidence:
+
+```bash
+ssh "$PRODUCTION_HOST" docker ps --format \
+  '{{.ID}} {{.Names}} {{.Label "com.docker.compose.project"}} {{.Image}}'
+ssh "$PRODUCTION_HOST" docker inspect "$BACKEND_CONTAINER" --format \
+  '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
+ssh "$PRODUCTION_HOST" docker inspect "$BACKEND_CONTAINER" --format \
+  '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+ssh "$PRODUCTION_HOST" docker inspect "$BACKEND_CONTAINER" --format \
+  '{{.Image}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+ssh "$PRODUCTION_HOST" docker image inspect "$BACKEND_IMAGE_ID" --format \
+  '{{json .RepoDigests}} {{.Architecture}}'
+```
+
+Repeat image checks for worker, connector and frontend. Read the identified
+active Compose file into a private, ignored evidence directory without printing
+its environment values. Derive backend/frontend repositories from the running
+image references and resolve immutable platform manifests before selecting a
+dependency carrier. Verify the database revision with a read-only query using
+the database container's existing credentials, without exposing them. Record
+inspection time and recheck the baseline immediately before authorized cutover.
+Reading deployment configuration does not authorize migration, backup, pulling
+images onto production, editing files there, or replacing containers.
 
 Resolve facts from the current deployment and secure inventory, not memory:
 
