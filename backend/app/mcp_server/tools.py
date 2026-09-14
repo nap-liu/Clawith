@@ -86,7 +86,7 @@ async def _resolve_visible_agent(db, user, agent_ref: str):
 # ── Shared helper: A2A-aware session scope ────────────────────────────────────
 
 
-async def _session_max_scope(db, user, sess: ChatSession) -> str:
+async def _session_max_scope(db, user, sess: ChatSession, *, for_write: bool = False) -> str:
     """Determine the maximum scope a human user has over a session.
 
     For A2A sessions we check both ``sess.agent_id`` and ``sess.peer_agent_id``
@@ -107,7 +107,7 @@ async def _session_max_scope(db, user, sess: ChatSession) -> str:
         a = (await db.execute(select(Agent).where(Agent.id == aid))).scalar_one_or_none()
         if a is None:
             continue
-        s = await sq.resolve_human_viewer_access(db, user.id, a)
+        s = await sq.resolve_human_viewer_access(db, user.id, a, for_write=for_write)
         if s == sq.SCOPE_ALL:
             return sq.SCOPE_ALL
         if s == sq.SCOPE_OWN:
@@ -204,7 +204,7 @@ async def _resolve_mcp_session(
         ).scalar_one_or_none()
         if sess is None:
             return None, "deny"
-        scope = await _session_max_scope(db, user, sess)
+        scope = await _session_max_scope(db, user, sess, for_write=True)
         pred = sq.scope_predicate_for(scope, sess.agent_id, user.id)
         if pred is None:
             return None, "deny"

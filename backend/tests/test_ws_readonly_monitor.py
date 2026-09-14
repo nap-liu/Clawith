@@ -69,6 +69,7 @@ def _handler() -> WebSocketChatHandler:
     # Bypass __init__ — we set only the fields the code under test touches.
     handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
     handler.pending_initial_assistant = None
+    handler.scene_manifest = None
     handler.project_session_access = None
     return handler
 
@@ -124,7 +125,7 @@ def _agent(creator_id):
 
 @pytest.mark.parametrize(
     ("role", "access"),
-    [("platform_admin", None), ("org_admin", None), ("agent_admin", "manage")],
+    [("platform_admin", None), ("org_admin", None), ("agent_admin", "manage"), ("member", "manage")],
 )
 def test_admins_can_view_all_sessions(role, access):
     agent = _agent(creator_id=uuid.uuid4())
@@ -164,7 +165,8 @@ def test_regular_member_cannot_view_others_sessions():
 # ── 2. _resolve_chat_session read-only admission ──────────────────────────────
 
 
-async def test_resolve_admits_privileged_viewer_as_read_only():
+@pytest.mark.parametrize("role,access", [("org_admin", None), ("member", "manage")])
+async def test_resolve_admits_privileged_viewer_as_read_only(role, access):
     owner_id = uuid.uuid4()
     viewer_id = uuid.uuid4()
     session_id = uuid.uuid4()
@@ -179,7 +181,7 @@ async def test_resolve_admits_privileged_viewer_as_read_only():
     h = _handler()
     h.session_id_param = str(session_id)
     h.agent_id = agent.id
-    viewer = SimpleNamespace(id=viewer_id, role="org_admin")
+    viewer = SimpleNamespace(id=viewer_id, role=role)
     h.read_only = False
     h.websocket = _FakeWS()
 
@@ -188,6 +190,7 @@ async def test_resolve_admits_privileged_viewer_as_read_only():
         viewer_id,
         viewer=viewer,
         agent=agent,
+        agent_access=access,
     )
 
     assert conv == str(session_id), "a privileged viewer is admitted to the session"

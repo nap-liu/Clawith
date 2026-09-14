@@ -38,6 +38,7 @@ from sqlalchemy import String, and_, cast, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import (
+    can_modify_other_agent_chat_sessions,
     can_view_all_agent_chat_sessions,
     get_agent_access_level_for_user_id,
 )
@@ -250,14 +251,8 @@ def _autonomous_where(agent_id: uuid.UUID, ctx_session_id):
     return base
 
 
-async def resolve_human_viewer_access(db: AsyncSession, user_id, agent: Agent) -> str:
-    """Map the authoritative access level to a scope kind for a human viewer.
-
-    Reuses ``permissions.get_agent_access_level_for_user_id`` which already:
-    enforces tenant match (incl. platform_admin), honors access_mode (org_admin
-    cannot read others' private agents), ignores the unrecognized ``agent_admin``
-    role, and is HTTP-exception free.
-    """
+async def resolve_human_viewer_access(db: AsyncSession, user_id, agent: Agent, *, for_write: bool = False) -> str:
+    """Resolve effective access; audit grants do not expand existing write authority."""
     viewer_id = _as_uuid(user_id)
     if viewer_id is None:
         return SCOPE_DENY
@@ -265,12 +260,13 @@ async def resolve_human_viewer_access(db: AsyncSession, user_id, agent: Agent) -
     if not level:
         return SCOPE_DENY
     viewer = await db.get(User, viewer_id)
-    if viewer is not None and can_view_all_agent_chat_sessions(viewer, agent, level):
+    can_access_all = can_modify_other_agent_chat_sessions if for_write else can_view_all_agent_chat_sessions
+    if viewer is not None and can_access_all(viewer, agent, level):
         return SCOPE_ALL
     return SCOPE_OWN
 
 
-async def resolve_scope(db: AsyncSession, agent: Agent, ctx_session_id: str, user_id):
+async def resolve_scope(db: AsyncSession, agent: Agent, ctx_session_id: str, user_id, *, for_write: bool = False):
     """Return ``(scope_kind, session_where_predicate)``.
 
     Authorization follows the canonical execution user. The channel is retained
@@ -279,7 +275,7 @@ async def resolve_scope(db: AsyncSession, agent: Agent, ctx_session_id: str, use
     """
     viewer_id = _as_uuid(user_id)
     if viewer_id is not None:
-        scope = await resolve_human_viewer_access(db, viewer_id, agent)
+        scope = await resolve_human_viewer_access(db, viewer_id, agent, for_write=for_write)
         if scope == SCOPE_ALL:
             return SCOPE_ALL, _all_sessions_where(agent.id)
         if scope == SCOPE_OWN:

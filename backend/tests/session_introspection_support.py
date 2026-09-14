@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import text
 
 from app.database import async_session, engine
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentPermission
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.tenant import Tenant
@@ -57,6 +57,9 @@ async def _seed_agent(creator_id, tenant_id=None, access_mode: str = "company", 
     async with async_session() as db:
         a = Agent(name=name, creator_id=creator_id, tenant_id=tenant_id, access_mode=access_mode)
         db.add(a)
+        await db.flush()
+        if access_mode == "company":
+            db.add(AgentPermission(agent_id=a.id, scope_type="company", access_level="use"))
         await db.commit()
         await db.refresh(a)
         return a

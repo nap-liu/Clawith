@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.permissions import (
+    can_modify_other_agent_chat_sessions,
     can_view_all_agent_chat_sessions,
     check_agent_access,
     filter_tenant_safe_chat_sessions,
@@ -647,7 +648,7 @@ async def rename_session(
             detail="Subagent sessions are runtime-owned and read-only; use stop_subagent.",
         )
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent, agent_access):
+    if str(session.user_id) != str(current_user.id) and not can_modify_other_agent_chat_sessions(current_user, agent, agent_access):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     session.title = body.title
@@ -679,7 +680,7 @@ async def delete_session(
             detail="Subagent sessions are runtime-owned and cannot be deleted.",
         )
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent, agent_access):
+    if str(session.user_id) != str(current_user.id) and not can_modify_other_agent_chat_sessions(current_user, agent, agent_access):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     child_run = (

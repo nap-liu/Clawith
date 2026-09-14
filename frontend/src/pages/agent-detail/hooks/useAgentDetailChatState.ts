@@ -72,7 +72,7 @@ export function useAgentDetailChatState({
     const isPlatformAdmin = currentUser?.role === 'platform_admin' || !!currentUser?.is_platform_admin;
     const canViewAllAgentChatSessions = isPlatformAdmin
         || currentUser?.role === 'org_admin'
-        || (currentUser?.role === 'agent_admin' && agent?.access_level === 'manage')
+        || agent?.access_level === 'manage'
         || isAgentOwner;
     const wsMapRef = useRef<Record<string, WebSocket>>({});
     const reconnectTimerRef = useRef<Record<string, ReturnType<typeof setTimeout> | null>>({});

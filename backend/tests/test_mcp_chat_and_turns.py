@@ -584,9 +584,11 @@ async def test_chat_unknown_agent_returns_error():
     assert "❌" in result
 
 
-async def test_chat_session_id_deny_wrong_user():
+@pytest.mark.parametrize("access_level", ["use", "manage"])
+async def test_chat_session_id_deny_wrong_user(access_level):
     """chat_with_agent with session_id belonging to a different user → _DENY."""
     from app.mcp_server.tools import chat_with_agent, _DENY
+    from app.models.agent import AgentPermission
 
     t = await _seed_tenant()
     user = await _seed_user(tenant_id=t.id, role="member")
@@ -597,11 +599,17 @@ async def test_chat_session_id_deny_wrong_user():
 
     # Session belonging to other_user
     other_sess = await _seed_session(agent.id, other_user.id, channel="mcp")
+    async with async_session() as db:
+        db.add(AgentPermission(agent_id=agent.id, scope_type="user", scope_id=user.id, access_level=access_level))
+        await db.commit()
 
-    result = await chat_with_agent(
-        _ctx(token), message="hi", agent=agent.name, session_id=str(other_sess.id)
-    )
-    # user is a plain member on a company agent → SCOPE_OWN → can't access other user's session
+    with patch("app.services.channel_llm._call_agent_llm", new_callable=AsyncMock) as mock_llm:
+        result = await chat_with_agent(
+            _ctx(token), message="hi", agent=agent.name, session_id=str(other_sess.id)
+        )
+        mock_llm.assert_not_awaited()
+    async with async_session() as db:
+        assert not list(await db.scalars(select(ChatMessage.id).where(ChatMessage.conversation_id == str(other_sess.id))))
     assert result == _DENY
 
 

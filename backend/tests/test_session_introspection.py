@@ -185,8 +185,8 @@ async def test_agent_admin_with_manage_access_sees_all_groups():
     assert str(northeast.id) in out
 
 
-async def test_plain_member_with_manage_access_remains_scoped_to_own_sessions():
-    """Manage capability alone does not grant the governance conversation archive."""
+async def test_plain_member_with_manage_access_can_audit_all_sessions():
+    """An effective Agent manage grant is sufficient without a tenant role change."""
     tenant = await _seed_tenant()
     creator = await _seed_user(tenant_id=tenant.id, name="Creator")
     manager = await _seed_user(tenant_id=tenant.id, name="Manager")
@@ -206,7 +206,7 @@ async def test_plain_member_with_manage_access_remains_scoped_to_own_sessions():
             )
         )
         await db.commit()
-        assert await resolve_human_viewer_access(db, manager.id, agent) == SCOPE_OWN
+        assert await resolve_human_viewer_access(db, manager.id, agent) == SCOPE_ALL
 
 
 async def test_scope_predicates_select_right_sessions():

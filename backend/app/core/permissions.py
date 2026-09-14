@@ -154,9 +154,20 @@ def can_view_all_agent_chat_sessions(
 
     Single source of truth for "who can see another user's conversation",
     shared by the REST session/message APIs (list/read) and the live WebSocket
-    monitor path. Platform admins, standard-Agent org governance, the Agent's
-    creator, and Agent admins with manage access qualify.
+    monitor path. Effective manage access qualifies regardless of tenant role.
+    Mutation authority remains separate from this audit capability.
     """
+    return can_modify_other_agent_chat_sessions(user, agent, agent_access_level) or (
+        current_agent_tenant_matches(user, agent) and agent_access_level == "manage"
+    )
+
+
+def can_modify_other_agent_chat_sessions(
+    user: User,
+    agent: Agent,
+    agent_access_level: str | None = None,
+) -> bool:
+    """Preserve existing cross-session write authority, including send and recall."""
     return current_agent_tenant_matches(user, agent) and (
         is_platform_admin_user(user)
         or (user.role == "org_admin" and getattr(agent, "scope", "standard") == "standard")

@@ -428,6 +428,7 @@ async def recall_message(
             agent,
             str(current_session_id or ""),
             user_id,
+            for_write=True,
         )
         target_session_id = session_query._as_uuid(candidate.conversation_id)
         if session_where is None or target_session_id is None:

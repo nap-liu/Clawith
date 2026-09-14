@@ -1,6 +1,7 @@
 """Mechanical continuation of normalized IM delivery lifecycle tests."""
 
 import pytest
+from app.models.agent import AgentPermission
 
 from tests.test_im_delivery import (
     UTC,
@@ -382,7 +383,8 @@ async def test_agent_cannot_recall_another_agents_message():
     assert result == {"status": "not_found", "message_id": str(row.id)}
 
 
-async def test_plain_member_cannot_recall_same_agents_other_users_message():
+@pytest.mark.parametrize("access_level", ["use", "manage"])
+async def test_plain_member_cannot_recall_same_agents_other_users_message(access_level):
     agent, owner = await _seed_agent()
     row = await _seed_message(
         agent,
@@ -409,6 +411,7 @@ async def test_plain_member_cannot_recall_same_agents_other_users_message():
         )
         db.add(viewer)
         await db.flush()
+        db.add(AgentPermission(agent_id=agent.id, scope_type="user", scope_id=viewer.id, access_level=access_level))
         viewer_session = ChatSession(
             agent_id=agent.id,
             user_id=viewer.id,
@@ -429,3 +432,6 @@ async def test_plain_member_cannot_recall_same_agents_other_users_message():
     )
 
     assert result == {"status": "not_found", "message_id": str(row.id)}
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row.id)
+        assert stored.message_meta == row.message_meta

@@ -37,6 +37,16 @@ editable. Creator-only is a clear-optional-grants shortcut; administrators retai
 their existing governance authority. Human grants do not replace A2A relationship,
 project membership, session visibility or execution identity gates.
 
+For human session audit, effective `manage` access is sufficient regardless of
+the tenant membership role, including ordinary `member` users. REST history,
+read-only WebSocket monitoring and session-introspection tools share this rule;
+the frontend exposes the same all-sessions entry. Company, department and user
+grants use the same resolved level. Existing project-specific gates remain
+separate from this role correction. This read capability does not change the
+existing authority to rename/delete another user's Session, send through MCP,
+or recall messages. Those operations select the existing write scope; read-only
+WebSocket monitoring still cannot send as the Session owner.
+
 Settings build editable subjects from the complete `grants` response. Display
 rosters only supply names and directory metadata; built-in administrator labels
 must not erase an explicit grant or replace its stored level. Inactive and

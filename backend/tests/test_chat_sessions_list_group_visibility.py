@@ -246,7 +246,7 @@ async def test_group_session_hidden_in_scope_mine_when_user_has_no_messages():
         "bob is not a member; he must not see the group in scope=mine"
 
 
-@pytest.mark.parametrize("role", ["platform_admin", "org_admin", "agent_admin"])
+@pytest.mark.parametrize("role", ["platform_admin", "org_admin", "agent_admin", "member"])
 async def test_governing_admin_can_list_and_read_group_without_membership(role: str):
     """Governance access is Agent-scoped, not conditional on IM membership."""
     from app.api.chat_sessions import get_session_messages, list_sessions
