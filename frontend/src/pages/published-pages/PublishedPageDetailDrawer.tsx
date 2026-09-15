@@ -13,16 +13,12 @@ import {
 import OrgMemberAccessPicker, {
   type AgentAccessUser,
 } from "../../components/OrgMemberAccessPicker";
-import Pagination from "../../components/Pagination";
+import PublishedPageVisitors from "./PublishedPageVisitors";
 import PublishedPageAttribution from "../../components/PublishedPageAttribution";
 import {
-  VISITOR_PAGE_SIZE,
-  formatTime,
   type AccessMode,
   type AccessUser,
-  type Paged,
   type PublishedPageDetail,
-  type Visitor,
 } from "./model";
 
 interface PublishedPageDetailDrawerProps {
@@ -47,10 +43,6 @@ interface PublishedPageDetailDrawerProps {
   saving: boolean;
   dirty: boolean;
   save: () => Promise<void>;
-  visitorsLoading: boolean;
-  visitorData?: Paged<Visitor>;
-  visitorPage: number;
-  setVisitorPage: (page: number) => void;
 }
 
 export default function PublishedPageDetailDrawer({
@@ -72,10 +64,6 @@ export default function PublishedPageDetailDrawer({
   saving,
   dirty,
   save,
-  visitorsLoading,
-  visitorData,
-  visitorPage,
-  setVisitorPage,
 }: PublishedPageDetailDrawerProps) {
   return (
     <div
@@ -395,102 +383,7 @@ export default function PublishedPageDetailDrawer({
             </div>
           </>
         ) : (
-          <section style={{ marginTop: 18 }}>
-            {visitorsLoading ? (
-              <p>加载中…</p>
-            ) : !visitorData?.items.length ? (
-              <p style={{ color: "var(--text-tertiary)", fontSize: 13 }}>
-                暂无访问记录
-              </p>
-            ) : (
-              visitorData.items.map((visitor) => (
-                <div
-                  key={visitor.id}
-                  style={{
-                    padding: "10px 0",
-                    borderBottom: "1px solid var(--border-subtle)",
-                    display: "grid",
-                    gridTemplateColumns: "minmax(0, 1fr) auto",
-                    gap: 10,
-                  }}
-                >
-                  <div style={{ minWidth: 0 }}>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "baseline",
-                        gap: 8,
-                        minWidth: 0,
-                      }}
-                    >
-                      <strong
-                        title={visitor.display_name}
-                        style={{
-                          minWidth: 0,
-                          maxWidth: visitor.email ? "42%" : "75%",
-                          fontSize: 13,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {visitor.display_name}
-                      </strong>
-                      {visitor.email && (
-                        <span
-                          title={visitor.email}
-                          style={{
-                            minWidth: 0,
-                            color: "var(--text-tertiary)",
-                            fontSize: 11,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {visitor.email}
-                        </span>
-                      )}
-                      {visitor.visitor_type === "anonymous" && (
-                        <span
-                          style={{
-                            color: "var(--text-tertiary)",
-                            fontSize: 10,
-                            flexShrink: 0,
-                          }}
-                        >
-                          未登录
-                        </span>
-                      )}
-                    </div>
-                    <div
-                      style={{
-                        color: "var(--text-tertiary)",
-                        fontSize: 11,
-                        marginTop: 4,
-                      }}
-                    >
-                      首次：{formatTime(visitor.first_viewed_at)} · 最近：
-                      {formatTime(visitor.last_viewed_at)}
-                    </div>
-                  </div>
-                  <span
-                    style={{ fontSize: 12, color: "var(--text-secondary)" }}
-                  >
-                    {visitor.view_count} 次
-                  </span>
-                </div>
-              ))
-            )}
-            {(visitorData?.total || 0) > VISITOR_PAGE_SIZE && (
-              <Pagination
-                page={visitorPage}
-                pageSize={VISITOR_PAGE_SIZE}
-                total={visitorData?.total || 0}
-                onPageChange={setVisitorPage}
-              />
-            )}
-          </section>
+          <PublishedPageVisitors key={selected.id} pageId={selected.id} />
         )}
 
         <OrgMemberAccessPicker

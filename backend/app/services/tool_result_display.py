@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from app.services.chat_attachments import attachment_from_workspace_path
 from app.services.tool_results import agent_resource_path, tool_content_visible, tool_result_text
+from app.utils.internal_login_redaction import redact_internal_login_values
 
 
 def tool_result_for_display(result: dict) -> dict:
@@ -51,7 +52,7 @@ def tool_result_for_display(result: dict) -> dict:
             content.append({"type": "unavailable"})
     if result.get("structuredContent") is not None:
         content.append({"type": "text", "text": json.dumps(result["structuredContent"], ensure_ascii=False, indent=2)})
-    return {"content": content, "isError": bool(result.get("isError")), "hasMedia": has_media}
+    return redact_internal_login_values({"content": content, "isError": bool(result.get("isError")), "hasMedia": has_media})
 
 
 def tool_event_for_display(event: dict) -> dict:
@@ -61,4 +62,4 @@ def tool_event_for_display(event: dict) -> dict:
         public["result"] = tool_result_text(event["tool_result"], audience="user")
     if event.get("_durable_message_id"):
         public["persistedMessageId"] = event["_durable_message_id"]
-    return public
+    return redact_internal_login_values(public)

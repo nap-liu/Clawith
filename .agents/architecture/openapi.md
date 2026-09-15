@@ -139,6 +139,33 @@ Bearer challenges. Audit stores client/user references, operation, status and
 request ID, never secrets, request bodies, phone values, code values or raw
 Authorization headers. Audit remains in the existing AuditLog domain.
 
+### Internal report access tool
+
+`create_published_page_login_link` reuses this login page, exchange endpoint and
+credential table. Its seeded schema accepts only a report URL/path/short ID.
+The caller identity comes from the canonical human conversation anchor, never
+tool arguments or an agent creator fallback. Issuance validates the destination
+syntax and platform origin without checking report visibility; ordinary report
+authorization remains authoritative when opened.
+
+Each internal signature has its own hashed credential row, a dedicated audience,
+five-minute expiry and atomic single redemption. Multiple signatures for the
+same report coexist. Exchange issues a normal one-hour user JWT carrying that
+signature's hash. A consumed or expired signature can be reopened only with its
+own still-valid JWT; exchange returns the same token without extending expiry.
+Report-session cookies retain the same absolute expiry through refreshes.
+Other ordinary user tokens are not revoked or shortened.
+Membership switches and company join/create flows reuse the shared derived-token
+issuer, retaining the temporary signature binding and absolute expiry. Fresh
+password/SSO authentication retains the ordinary independent login policy.
+
+The URL uses an `agent_code` fragment and is returned only to the assistant via
+standard tool-result audience annotations. It must only be opened by the agent's
+private browser and never delivered to users. Shared visible-output, tool-display
+and log sanitizers redact the credential if echoed. The login page removes the
+fragment before exchange; failed internal exchanges return directly to the
+existing `/login` interface without special errors or recovery flows.
+
 ## Validation and lifecycle
 
 Use isolated Docker PostgreSQL and Redis with the exact checkout mounted.

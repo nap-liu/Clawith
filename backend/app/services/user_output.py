@@ -1,6 +1,7 @@
 """Shared guard for text that can become visible to product users."""
 
 import re
+from app.utils.internal_login_redaction import INCOMPLETE_CREDENTIAL, redact_internal_login
 
 # Keep the legacy brand token out of new user-facing source text as well as at
 # runtime. Infrastructure identifiers remain outside this presentation guard.
@@ -26,6 +27,7 @@ def sanitize_user_visible_text(text: str) -> str:
     Matching is case-insensitive and applies even when the token is embedded in
     another word. Text that does not contain the token is returned unchanged.
     """
+    text = redact_internal_login(text)
     if not _BANNED_RE.search(text):
         return text
 
@@ -45,6 +47,14 @@ class UserOutputStreamSanitizer:
 
     def feed(self, chunk: str) -> str:
         combined = self._tail + str(chunk or "")
+        pending = INCOMPLETE_CREDENTIAL.search(combined)
+        if pending:
+            prefix = combined[:pending.start()]
+            if len(prefix) <= self._GUARD_CHARS:
+                self._tail = combined
+                return ""
+            self._tail = prefix[-self._GUARD_CHARS:] + combined[pending.start():]
+            return sanitize_user_visible_text(prefix[:-self._GUARD_CHARS])
         cleaned = sanitize_user_visible_text(combined)
         if len(cleaned) <= self._GUARD_CHARS:
             self._tail = cleaned

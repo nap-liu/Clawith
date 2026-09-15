@@ -2063,6 +2063,18 @@
     "skillMarket": "Skill Market"
   },
   "publishedPages": {
+    "visitors": {
+        "searchPlaceholder": "Search name, email or anonymous visitor ID",
+        "loading": "Loading…",
+        "loadError": "Failed to load visit history",
+        "retry": "Retry",
+        "matches": "{{count}} visitors found",
+        "noMatches": "No matching visits",
+        "empty": "No visits yet",
+        "anonymous": "Not signed in",
+        "times": "First: {{first}} · Latest: {{last}}",
+        "views": "{{count}} visits"
+    },
     "filters": {
       "allAgents": "All digital employees",
       "selectedAgents": "{{count}} digital employees selected",
@@ -4095,6 +4107,7 @@
         "send_email": "Send Email",
         "read_emails": "Read Emails",
         "reply_email": "Reply Email",
+        "create_published_page_login_link": "Generate Temporary Access Link",
         "publish_page": "Publish Page",
         "list_published_pages": "List Published Pages",
         "search_clawhub": "Search ClawHub",
@@ -4168,6 +4181,7 @@
         "send_email": "Send an email to one or more recipients.",
         "read_emails": "Read emails from your inbox.",
         "reply_email": "Reply to an email by its Message-ID.",
+        "create_published_page_login_link": "Generate a temporary link to view a report.",
         "publish_page": "Publish an HTML file from workspace as a public page.",
         "list_published_pages": "List all pages published by this agent.",
         "search_clawhub": "Search the ClawHub skill registry for skills matching a query.",

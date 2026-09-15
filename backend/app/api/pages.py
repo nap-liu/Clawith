@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
-from sqlalchemy import String, func, literal, select, union_all, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,7 @@ from app.api.page_admin_helpers import (
     _validated_allowed_user_ids,
 )
 from app.api.page_admin_queries import list_manageable_pages
+from app.api.page_visitor_queries import list_visitors
 from app.api.page_models import (
     PageAccessUpdate,
     PageBulkAccessUpdate,
@@ -48,10 +49,9 @@ from app.services.org_directory import (
 )
 from app.services.published_page_access import (
     PAGE_SESSION_COOKIE,
-    PAGE_SESSION_HOURS,
     can_manage_page,
     can_view_page,
-    create_page_session,
+    set_page_session_cookie,
     page_user_from_session,
 )
 from app.services.storage import get_storage_backend, normalize_storage_key
@@ -248,16 +248,7 @@ async def _render_page_content(
         },
     )
     if user is not None:
-        content_response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
-        content_response.set_cookie(
-            PAGE_SESSION_COOKIE,
-            create_page_session(user.id),
-            max_age=PAGE_SESSION_HOURS * 3600,
-            httponly=True,
-            samesite="lax",
-            secure=_request_scheme(request) == "https",
-            path="/",
-        )
+        set_page_session_cookie(content_response, request, user.id)
     elif new_visitor_cookie:
         _set_public_visitor_cookie(content_response, new_visitor_cookie, request)
     return content_response
@@ -308,16 +299,7 @@ async def render_page(short_id: str, request: Request, db: AsyncSession = Depend
         "Cache-Control": "no-store",
     })
     if user is not None:
-        viewer_response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
-        viewer_response.set_cookie(
-            PAGE_SESSION_COOKIE,
-            create_page_session(user.id),
-            max_age=PAGE_SESSION_HOURS * 3600,
-            httponly=True,
-            samesite="lax",
-            secure=_request_scheme(request) == "https",
-            path="/",
-        )
+        set_page_session_cookie(viewer_response, request, user.id)
     else:
         _visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
         if new_visitor_cookie:
@@ -340,15 +322,7 @@ async def create_render_session(
         raise HTTPException(403, "无权访问此页面")
     if not await _page_source_exists(page):
         raise HTTPException(404, "Source file no longer exists")
-    response.set_cookie(
-        PAGE_SESSION_COOKIE,
-        create_page_session(current_user.id),
-        max_age=PAGE_SESSION_HOURS * 3600,
-        httponly=True,
-        samesite="lax",
-        secure=_request_scheme(request) == "https",
-        path="/",
-    )
+    set_page_session_cookie(response, request, current_user.id)
     pending = bool(await db.scalar(select(PublishedPageAccess.id).where(
         PublishedPageAccess.page_id == page.id,
         PublishedPageAccess.user_id == current_user.id,
@@ -539,70 +513,17 @@ async def list_page_visitors(
     page_id: uuid.UUID,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    q: str | None = Query(default=None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     published_page = await db.get(PublishedPage, page_id)
     if not published_page or not await can_manage_page(db, published_page, current_user):
         raise HTTPException(404, "Page not found")
-    authenticated_visitors = (
-        select(
-            PublishedPageVisitor.user_id.label("id"),
-            User.display_name.label("display_name"),
-            Identity.email.label("email"),
-            literal("authenticated", String).label("visitor_type"),
-            literal(None, String).label("visitor_key"),
-            PublishedPageVisitor.view_count.label("view_count"),
-            PublishedPageVisitor.first_viewed_at.label("first_viewed_at"),
-            PublishedPageVisitor.last_viewed_at.label("last_viewed_at"),
-        )
-        .join(PublishedPageVisitor, PublishedPageVisitor.user_id == User.id)
-        .outerjoin(Identity, Identity.id == User.identity_id)
-        .where(PublishedPageVisitor.page_id == page_id)
+    return await list_visitors(
+        db, page_id=page_id, page=page, page_size=page_size,
+        search=q, overflow_key=ANONYMOUS_VISITOR_OVERFLOW_KEY,
     )
-    anonymous_visitors = select(
-        PublishedPageAnonymousVisitor.id.label("id"),
-        literal("匿名访客", String).label("display_name"),
-        literal(None, String).label("email"),
-        literal("anonymous", String).label("visitor_type"),
-        PublishedPageAnonymousVisitor.visitor_key.label("visitor_key"),
-        PublishedPageAnonymousVisitor.view_count.label("view_count"),
-        PublishedPageAnonymousVisitor.first_viewed_at.label("first_viewed_at"),
-        PublishedPageAnonymousVisitor.last_viewed_at.label("last_viewed_at"),
-    ).where(PublishedPageAnonymousVisitor.page_id == page_id)
-    combined_visitors = union_all(authenticated_visitors, anonymous_visitors).subquery()
-    total = await db.scalar(select(func.count()).select_from(combined_visitors))
-    rows = (await db.execute(
-        select(combined_visitors)
-        .order_by(combined_visitors.c.last_viewed_at.desc(), combined_visitors.c.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )).mappings().all()
-    return {
-        "items": [{
-            "id": (
-                f"anonymous:{row['id']}" if row["visitor_type"] == "anonymous"
-                else str(row["id"])
-            ),
-            "display_name": (
-                (
-                    "其他匿名访客"
-                    if row["visitor_key"] == ANONYMOUS_VISITOR_OVERFLOW_KEY
-                    else f"匿名访客 {row['visitor_key'][:12].upper()}"
-                )
-                if row["visitor_type"] == "anonymous"
-                else row["display_name"]
-            ),
-            "email": row["email"],
-            "visitor_type": row["visitor_type"],
-            "view_count": row["view_count"],
-            "first_viewed_at": row["first_viewed_at"].isoformat() if row["first_viewed_at"] else None,
-            "last_viewed_at": row["last_viewed_at"].isoformat() if row["last_viewed_at"] else None,
-        } for row in rows],
-        "total": int(total or 0),
-        "page": page,
-        "page_size": page_size,
-    }
 
 
 async def _manageable_page(db: AsyncSession, page_id: uuid.UUID, user: User) -> PublishedPage:

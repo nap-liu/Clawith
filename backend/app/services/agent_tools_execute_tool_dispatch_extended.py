@@ -103,6 +103,7 @@ from app.services.agent_tools_deploy_ops import (
 )
 from app.services.agent_tools_execute_tool_preflight import ExecuteToolDispatchContext
 from app.services.agent_tools_temp_workspace_exec import _run_with_temp_workspace
+from app.services.agent_login import create_agent_login_link
 
 _ROOT_TOOL_SYMBOLS = (
     "_agentbay_browser_click",
@@ -298,6 +299,8 @@ async def execute_tool_dispatch_extended(state: ExecuteToolDispatchContext) -> s
     elif tool_name in ("send_email", "read_emails", "reply_email"):
         result = await _handle_email_tool(tool_name, agent_id, ws, arguments)
     # ── Pages: public HTML hosting ──
+    elif tool_name == "create_published_page_login_link":
+        result = await create_agent_login_link(agent_id, user_id, session_id, turn_anchor_id, arguments)
     elif tool_name == "publish_page":
         result = await _publish_page(agent_id, user_id, ws, arguments)
     elif tool_name == "list_published_pages":

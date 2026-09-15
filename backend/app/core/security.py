@@ -128,7 +128,8 @@ def decrypt_data(ciphertext: str, key: str) -> str:
 
 
 
-def create_access_token(user_id: str, role: str, expires_delta: timedelta | None = None) -> str:
+def create_access_token(user_id: str, role: str, expires_delta: timedelta | None = None,
+                        *, login_code_hash: str | None = None, expires_at: float | None = None) -> str:
     """Create a JWT access token."""
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -136,9 +137,20 @@ def create_access_token(user_id: str, role: str, expires_delta: timedelta | None
     to_encode = {
         "sub": user_id,
         "role": role,
-        "exp": expire,
+        "exp": expires_at if expires_at is not None else expire,
     }
+    if login_code_hash:
+        to_encode["login_code_hash"] = login_code_hash
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def create_derived_access_token(request: Request, user_id: str, role: str) -> str:
+    """Keep a temporary login's deadline when changing membership context."""
+    source = getattr(request.state, "access_token_payload", {})
+    if not source.get("login_code_hash"):
+        return create_access_token(user_id, role)
+    return create_access_token(user_id, role, expires_at=source["exp"],
+                               login_code_hash=source["login_code_hash"])
 
 
 def decode_access_token(token: str) -> dict:
@@ -184,7 +196,7 @@ def set_access_token_cookie(
     response.set_cookie(
         ACCESS_TOKEN_COOKIE_NAME,
         token,
-        max_age=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        max_age=max(0, int(decode_access_token(token)["exp"] - datetime.now(timezone.utc).timestamp())),
         httponly=True,
         secure=_request_is_secure(request),
         samesite="lax",
@@ -216,6 +228,7 @@ async def get_current_user(
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     payload = decode_access_token(token)
+    request.state.access_token_payload = payload
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
@@ -248,6 +261,7 @@ async def get_authenticated_user(
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     payload = decode_access_token(token)
+    request.state.access_token_payload = payload
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")

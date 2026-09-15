@@ -1,7 +1,12 @@
 """MCP, email, pages, skills, and AgentBay tool schemas."""
 
+from app.services.agent_login_contract import AGENT_LOGIN_SEED
 
 AGENT_TOOL_INTEGRATIONS = [
+    {"type": "function", "function": {
+        "name": AGENT_LOGIN_SEED["name"], "description": AGENT_LOGIN_SEED["description"],
+        "parameters": AGENT_LOGIN_SEED["parameters_schema"],
+    }},
     {
         "type": "function",
         "function": {

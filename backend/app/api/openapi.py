@@ -11,6 +11,8 @@ from app.core.events import get_redis
 from app.core.permissions import build_visible_agents_query, check_agent_access
 from app.core.security import create_access_token, set_access_token_cookie
 from app.database import get_db
+from app.services.agent_login import exchange_agent_login
+from app.services.openapi_login import AGENT_AUDIENCE
 from app.models.agent import Agent
 from app.models.openapi_application import OpenAPICredential
 from app.schemas.openapi_application import LoginLinkInput, LoginExchangeInput, EmployeeSearchInput, EmployeeAccessInput
@@ -240,7 +242,9 @@ async def login_link(body: LoginLinkInput, request: Request,
              })
 async def exchange_link(body: LoginExchangeInput, request: Request, response: Response,
                         db: AsyncSession = Depends(get_db)):
-    payload = verify_login_code(body.code)
+    payload = verify_login_code(body.code, allow_agent=True, allow_expired_agent=True)
+    if payload.get("aud") == AGENT_AUDIENCE:
+        return await exchange_agent_login(db, body.code, payload, request, response)
     app, value = await credential(db, body.code, "login", lock=True)
     request.state.openapi_application_id = app.id
     request.state.openapi_user_id = value.user_id

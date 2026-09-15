@@ -170,6 +170,7 @@
     "upsert_member_daily_report": {"name": "保存成员日报", "description": "为指定用户或 Agent 创建或更新规范化的最终日报。"},
     "list_page_access_requests": {"name": "列出页面访问申请", "description": "查看已发布页面的真实访问申请、状态和处理时间。"},
     "list_published_pages": {"name": "列出已发布页面", "description": "列出当前 Agent 发布的页面、权限、访问量和待处理申请。"},
+    "create_published_page_login_link": {"name": "生成临时访问链接", "description": "生成用于查看报告的临时访问链接。"},
     "publish_page": {"name": "发布页面", "description": "将工作区 HTML 发布为网页，并设置公开、登录或指定用户访问。"},
     "search_page_viewers": {"name": "搜索页面访问用户", "description": "在公司内搜索活跃用户，获取页面权限所需的用户 ID。"},
     "update_published_page_access": {"name": "更新页面访问权限", "description": "修改已发布页面的访问模式和完整允许用户列表。"},

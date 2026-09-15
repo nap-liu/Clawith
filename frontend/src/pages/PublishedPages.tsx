@@ -31,13 +31,11 @@ import {
   PAGE_SIZE_OPTIONS,
   readPageNumber,
   readPageSize,
-  VISITOR_PAGE_SIZE,
   type AccessMode,
   type AccessUser,
   type Paged,
   type PublishedPage,
   type PublishedPageDetail,
-  type Visitor,
 } from "./published-pages/model";
 import "./PublishedPages.css";
 
@@ -76,7 +74,6 @@ export default function PublishedPages() {
   const [activeTab, setActiveTab] = useState<"permissions" | "visitors">(
     "permissions",
   );
-  const [visitorPage, setVisitorPage] = useState(1);
   const [mode, setMode] = useState<AccessMode>("public");
   const [selectedPeople, setSelectedPeople] = useState<AgentAccessUser[]>([]);
   const [showMemberPicker, setShowMemberPicker] = useState(false);
@@ -125,14 +122,6 @@ export default function PublishedPages() {
       fetchJson<PublishedPageDetail>(`/pages/${selectedPageId}/detail`),
     enabled: Boolean(selectedPageId),
   });
-  const { data: visitorData, isLoading: visitorsLoading } = useQuery({
-    queryKey: ["published-pages", "visitors", selectedPageId, visitorPage],
-    queryFn: () =>
-      fetchJson<Paged<Visitor>>(
-        `/pages/${selectedPageId}/visitors?page=${visitorPage}&page_size=${VISITOR_PAGE_SIZE}`,
-      ),
-    enabled: Boolean(selectedPageId) && activeTab === "visitors",
-  });
 
   useEffect(() => {
     setSearchDraft(searchQuery);
@@ -159,7 +148,6 @@ export default function PublishedPages() {
         })),
     );
     setActiveTab("permissions");
-    setVisitorPage(1);
     setShowDeleteConfirm(false);
   }, [selectedPageId, selected]);
 
@@ -375,13 +363,6 @@ export default function PublishedPages() {
     }
   };
 
-  useEffect(() => {
-    const lastPage = Math.max(
-      1,
-      Math.ceil((visitorData?.total || 0) / VISITOR_PAGE_SIZE),
-    );
-    if (visitorPage > lastPage) setVisitorPage(lastPage);
-  }, [visitorData?.total, visitorPage]);
   const pendingUsers =
     selected?.access_users.filter((user) => user.status === "pending") || [];
   const hasAppliedFilters = Boolean(
@@ -695,10 +676,6 @@ export default function PublishedPages() {
           saving={saving}
           dirty={dirty}
           save={save}
-          visitorsLoading={visitorsLoading}
-          visitorData={visitorData}
-          visitorPage={visitorPage}
-          setVisitorPage={setVisitorPage}
         />
       )}
       <ConfirmModal

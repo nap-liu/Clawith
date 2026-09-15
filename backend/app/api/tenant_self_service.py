@@ -216,7 +216,7 @@ async def self_create_company(
     if current_user.tenant_id is not None:
         # Multi-tenant: user already belongs to a company.
         # Create a NEW User record for the new tenant instead of overwriting.
-        from app.core.security import create_access_token
+        from app.core.security import create_derived_access_token
         from app.models.participant import Participant
 
         new_user = User(
@@ -245,7 +245,7 @@ async def self_create_company(
         await registration_service.bind_org_member(db, new_user)
 
         # Generate token scoped to the new user so frontend can switch context
-        access_token = create_access_token(str(new_user.id), new_user.role)
+        access_token = create_derived_access_token(request, str(new_user.id), new_user.role)
     else:
         # Registration flow: user has no tenant yet, assign directly
         current_user.tenant_id = tenant.id

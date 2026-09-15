@@ -2,7 +2,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -42,9 +42,14 @@ class OpenAPIUserBinding(Base):
 
 class OpenAPICredential(Base):
     __tablename__ = "openapi_credentials"
+    __table_args__ = (CheckConstraint(
+        "(kind = 'agent_login' AND application_id IS NULL AND user_id IS NOT NULL) "
+        "OR (kind <> 'agent_login' AND application_id IS NOT NULL)",
+        name="ck_openapi_credential_issuer",
+    ),)
 
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    application_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("openapi_applications.id"), nullable=False, index=True)
+    application_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("openapi_applications.id"), nullable=True, index=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     scopes: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)

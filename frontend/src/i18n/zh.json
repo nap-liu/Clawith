@@ -4136,6 +4136,7 @@
         "send_email": "发送邮件",
         "read_emails": "读取邮件",
         "reply_email": "回复邮件",
+        "create_published_page_login_link": "生成临时访问链接",
         "publish_page": "发布页面",
         "list_published_pages": "列出已发布页面",
         "search_clawhub": "搜索 ClawHub",
@@ -4209,6 +4210,7 @@
         "send_email": "向一个或多个收件人发送邮件。",
         "read_emails": "从收件箱读取邮件。",
         "reply_email": "按 Message-ID 回复邮件。",
+        "create_published_page_login_link": "生成用于查看报告的临时访问链接。",
         "publish_page": "将工作区中的 HTML 文件发布为公共页面。",
         "list_published_pages": "列出此数字员工发布的所有页面。",
         "search_clawhub": "在 ClawHub 技能注册表中搜索匹配查询的技能。",
@@ -5577,6 +5579,18 @@
     "colScope": "范围"
   },
   "publishedPages": {
+    "visitors": {
+        "searchPlaceholder": "搜索姓名、邮箱或匿名访客编号",
+        "loading": "加载中…",
+        "loadError": "加载访问记录失败",
+        "retry": "重试",
+        "matches": "找到 {{count}} 位访客",
+        "noMatches": "未找到匹配的访问记录",
+        "empty": "暂无访问记录",
+        "anonymous": "未登录",
+        "times": "首次：{{first}} · 最近：{{last}}",
+        "views": "{{count}} 次"
+    },
     "filters": {
       "allAgents": "全部数字员工",
       "selectedAgents": "已选 {{count}} 个数字员工",

@@ -33,7 +33,33 @@ one-click clear action without requiring the menu to be opened; clearing also
 removes `agent_ids` from the URL and resets pagination.  All controls reuse
 shared dropdown, multi-select, search, button, and i18n primitives.
 
+## Visitor history
+
+`GET /api/pages/{page_id}/visitors` checks page management permission before
+searching. Its optional `q` applies case-insensitive literal substring matching
+to visitor display names, emails, and the displayed anonymous visitor label/ID.
+Whitespace-only input is unfiltered; SQL wildcard characters remain literal.
+Filtering precedes counting and pagination across authenticated and anonymous
+visitors, retaining the latest-visit ordering and page scope.
+
+The visitor panel reuses shared search, button and pagination controls. Search
+applies on Enter or the search button; reset/clear restores the full history,
+and a new query returns to page one. Names reserve at least ten Chinese
+characters when truncation is necessary. Email/anonymous status follows the
+name with a small gap; short names do not reserve an empty column. Email wraps
+to the next line when necessary and truncates within its available width. Truncated names
+retain the full native title tooltip, following existing text presentation.
+Visitor-panel copy uses standard i18n resources.
+
 ## Login recovery
+
+Agents can use the opt-in `create_published_page_login_link` tool to open a
+report as the current human participant. It reuses the temporary login owner;
+issuance does not check report visibility. The internal signature lasts five
+minutes and redeems once into a one-hour login. Reopening with that signature's
+own valid token preserves its expiry; report-cookie refresh cannot extend it.
+Failed internal exchanges stay on ordinary login without automatic SSO or a
+special error flow. See [OpenAPI login lifecycle](openapi.md#internal-report-access-tool).
 
 Protected report URLs request automatic SSO when they redirect to the access
 page, carrying the report's tenant and original return URL. An optional `sso`

@@ -1,6 +1,7 @@
 """Small shared helpers for published-page authorization."""
 
 import uuid
+import math
 from datetime import datetime, timedelta, timezone
 
 from jose import JWTError, jwt
@@ -8,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.security import _request_is_secure
 from app.core.permissions import is_platform_admin_user
 from app.models.agent import Agent
 from app.models.published_page import PublishedPage, PublishedPageAccess
@@ -17,17 +19,43 @@ PAGE_SESSION_COOKIE = "published_page_session"
 PAGE_SESSION_HOURS = 12
 
 
-def create_page_session(user_id: uuid.UUID) -> str:
+def create_page_session(user_id: uuid.UUID, *, expires_at: float | None = None) -> str:
     settings = get_settings()
-    return jwt.encode(
-        {
+    payload = {
             "sub": str(user_id),
             "typ": "published_page_session",
-            "exp": datetime.now(timezone.utc) + timedelta(hours=PAGE_SESSION_HOURS),
-        },
+            "exp": expires_at if expires_at is not None else datetime.now(timezone.utc) + timedelta(hours=PAGE_SESSION_HOURS),
+        }
+    if expires_at is not None:
+        payload["absolute_exp"] = expires_at
+    return jwt.encode(
+        payload,
         settings.SECRET_KEY,
         algorithm="HS256",
     )
+
+
+def set_page_session_cookie(response, request, user_id, *, expires_at=None):
+    """Preserve the expiry of a temporary login across report refreshes."""
+    access = getattr(request.state, "access_token_payload", None)
+    if expires_at is None and access is not None:
+        if access.get("login_code_hash"):
+            expires_at = access["exp"]
+    elif expires_at is None:
+        try:
+            payload = jwt.decode(request.cookies.get(PAGE_SESSION_COOKIE, ""),
+                                 get_settings().SECRET_KEY, algorithms=["HS256"])
+            if payload.get("typ") == "published_page_session" and payload.get("sub") == str(user_id):
+                expires_at = payload.get("absolute_exp")
+        except JWTError:
+            pass
+    max_age = PAGE_SESSION_HOURS * 3600 if expires_at is None else max(
+        0, math.ceil(expires_at - datetime.now(timezone.utc).timestamp()),
+    )
+    response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
+    response.set_cookie(PAGE_SESSION_COOKIE, create_page_session(user_id, expires_at=expires_at),
+                        max_age=max_age, httponly=True, samesite="lax",
+                        secure=_request_is_secure(request), path="/")
 
 
 def decode_page_session(token: str | None) -> uuid.UUID | None:

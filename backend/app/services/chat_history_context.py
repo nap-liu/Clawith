@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.services.chat_history_assistant import *  # noqa: F401,F403
 from app.services.tool_result_display import tool_result_for_display
 from app.services.tool_results import tool_result_text
+from app.utils.internal_login_redaction import redact_internal_login_values
 
 def parse_tool_call_for_display(content: str) -> dict[str, Any]:
     """Parse a stored ``tool_call`` row's JSON content into the web UI display
@@ -36,7 +37,7 @@ def parse_tool_call_for_display(content: str) -> dict[str, Any]:
     if payload.get("tool_result"):
         display["toolResultContent"] = tool_result_for_display(payload["tool_result"])
         display["toolResult"] = tool_result_text(payload["tool_result"], audience="user")
-    return display
+    return redact_internal_login_values(display)
 
 
 def strip_leading_orphan_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

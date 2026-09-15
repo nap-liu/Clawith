@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.security import (
     clear_access_token_cookie,
-    create_access_token,
+    create_derived_access_token,
     get_authenticated_user,
     get_current_user,
     hash_password_async,
@@ -171,7 +171,7 @@ async def switch_tenant(
 
     await require_active_authentication_principal(db, target_user)
     # 3. Generate new token
-    token = create_access_token(str(target_user.id), target_user.role)
+    token = create_derived_access_token(request, str(target_user.id), target_user.role)
     set_access_token_cookie(response, request, token)
 
     # 4. Determine redirect URL

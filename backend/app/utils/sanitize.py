@@ -3,6 +3,7 @@
 import re
 from copy import deepcopy
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse, urlunsplit
+from app.utils.internal_login_redaction import redact_internal_login
 
 # Data-URL for inline images — redacted to prevent base64 payload pollution
 # in audit logs, WebSocket broadcasts, and session history.
@@ -87,7 +88,7 @@ def sanitize_sensitive_values(value):
     if isinstance(value, tuple):
         return tuple(sanitize_sensitive_values(item) for item in value)
     if isinstance(value, str):
-        return _mask_sensitive_url_query(_redact_if_base64_image(value))
+        return redact_internal_login(_mask_sensitive_url_query(_redact_if_base64_image(value)))
     return value
 
 
@@ -118,7 +119,7 @@ def sanitize_tool_args(args: dict | None) -> dict | None:
         # Redact base64 image data URIs (strings and list items)
         val = sanitized[key]
         if isinstance(val, str):
-            sanitized[key] = _redact_if_base64_image(val)
+            sanitized[key] = redact_internal_login(_redact_if_base64_image(val))
         elif isinstance(val, list):
             sanitized[key] = [_redact_if_base64_image(item) for item in val]
 

@@ -34,7 +34,11 @@ function exchangeOnce(code: string) {
 export default function OpenApiLogin() {
     const { t } = useTranslation();
     const setAuth = useAuthStore((state) => state.setAuth);
-    const [code] = useState(() => new URLSearchParams(window.location.search).get('code') || '');
+    const [internalLogin] = useState(() =>
+        new URLSearchParams(window.location.hash.slice(1)).has('agent_code'));
+    const [code] = useState(() =>
+        new URLSearchParams(window.location.hash.slice(1)).get('agent_code')
+        || new URLSearchParams(window.location.search).get('code') || '');
     const [errorKey, setErrorKey] = useState('');
 
     useEffect(() => {
@@ -42,6 +46,7 @@ export default function OpenApiLogin() {
         // Neither browser history nor a subsequent navigation retains the login code.
         window.history.replaceState({}, '', window.location.pathname);
         if (!code || code.length > 8192) {
+            if (internalLogin) { window.location.replace('/login'); return; }
             setErrorKey('openapiLogin.expired');
             return;
         }
@@ -49,6 +54,7 @@ export default function OpenApiLogin() {
             if (!active) return;
             const destination = safeLoginReturnTo(result.redirect_uri);
             if (!result.access_token || !result.user?.id || !destination) {
+                if (internalLogin) { window.location.replace('/login'); return; }
                 setErrorKey('openapiLogin.failed');
                 return;
             }
@@ -56,12 +62,13 @@ export default function OpenApiLogin() {
             window.location.replace(bindHostContextToDestination(destination, result.host_context, result.user.id));
         }).catch((error: unknown) => {
             if (!active) return;
+            if (internalLogin) { window.location.replace('/login'); return; }
             const status = (error as { status?: number }).status;
             setErrorKey(status === 400 || status === 401 || status === 410
                 ? 'openapiLogin.expired' : 'openapiLogin.failed');
         });
         return () => { active = false; };
-    }, [code, setAuth]);
+    }, [code, internalLogin, setAuth]);
 
     return (
         <main style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100dvh', padding: 24, textAlign: 'center', gap: 16 }}>
