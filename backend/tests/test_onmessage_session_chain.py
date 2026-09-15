@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -616,7 +618,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
         user_id=user.id,
         turn_anchor_id=current_turn.id,
     )
-    assert result.startswith("✅")
+    assert json.loads(result)["ok"]
 
     async with async_session() as db:
         stored = (

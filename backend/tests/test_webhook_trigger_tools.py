@@ -269,6 +269,7 @@ async def test_webhook_guidance_reaches_seeded_llm_runtime():
     for tool in tool_rows:
         runtime = runtime_by_name[tool.name]
         assert runtime["parameters"] == tool.parameters_schema
+        assert runtime["parameters"]["properties"]["clear_fields"]["items"]["type"] == "string"
         mode = runtime["parameters"]["properties"]["webhook_mode"]
         assert mode["type"] == "string"
         assert mode["enum"] == ["legacy", "queue", "merge"]

@@ -401,3 +401,23 @@ delivery change is required.
 - File tools use exact canonical virtual paths and report the failing stage
   truthfully. Fuzzy filename repair and cross-tool canned failure counters hide
   evidence and are not recovery mechanisms.
+
+## Trigger management contract
+
+The existing set/update/list/cancel tools and management API share the trigger
+patch service. Omitted fields retain their values. Configuration objects merge
+recursively; arrays replace as a whole. `clear_fields` uses JSON Pointer paths
+for explicit removal of optional configuration keys or clearing nullable fields.
+JSON null inside configuration remains a value. Overlapping writes and clears,
+array-element clears, required-field removal and internal-state changes fail
+before persistence. Private configuration and its containing subtrees remain
+protected by each adapter's existing authorization projection.
+
+Updates lock the current record, validate the merged candidate, then apply the
+existing execution-identity policy in the same transaction. Re-enabling an
+existing name keeps its type, fire history and omitted options. Management
+responses preserve complete authorized configuration, reasons and options;
+list pagination returns whole records. Large tool outputs continue through the
+shared full-result storage and bounded model-facing view. Message-trigger
+matching retains the complete source message rather than a character slice.
+Seeded and fallback definitions come from `trigger_tool_contract.py`.

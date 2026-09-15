@@ -358,7 +358,7 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
             user_id=user_id,
         )
     elif tool_name == "list_triggers":
-        result = await _handle_list_triggers(agent_id)
+        result = await _handle_list_triggers(agent_id, arguments)
     elif tool_name == "search_contacts":
         result = await _search_contacts_tool(agent_id, arguments, user_id)
     elif tool_name == "add_contact":

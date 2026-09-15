@@ -227,7 +227,7 @@ async def wake_agent_with_context(
         type="on_message",
         config={
             "from_agent_name": from_agent_name,
-            "_matched_message": message_context[:2000],
+            "_matched_message": message_context,
             "_matched_from": "agent",
             "_a2a_session_id": a2a_session_id,
         },

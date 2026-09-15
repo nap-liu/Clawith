@@ -240,7 +240,7 @@ async def _invoke_agent_for_triggers(
                     part += format_cron_timing_context(cfg, context_executed_at)
                 if t.type == "on_message" and cfg.get("_matched_message"):
                     part += (
-                        f'\nMatched message from {cfg.get("_matched_from", "?")}:\n"{cfg["_matched_message"][:500]}"'
+                        f'\nMatched message from {cfg.get("_matched_from", "?")}:\n"{cfg["_matched_message"]}"'
                     )
                 if t.type == "on_message" and cfg.get("okr_member_id") and cfg.get("okr_report_date"):
                     part += (

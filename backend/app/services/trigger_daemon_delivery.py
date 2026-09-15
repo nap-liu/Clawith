@@ -101,7 +101,7 @@ def _audit_webhook_failed(db, agent_id, name, detail):
             AuditLog(
                 agent_id=agent_id,
                 action="webhook_session_failed",
-                details={"trigger_name": name, "payload": str(detail)[:2000]},
+                details={"trigger_name": name, "payload": str(detail)},
             )
         )
     except Exception:

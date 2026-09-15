@@ -446,7 +446,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
 
                 if msg is None:
                     return False
-                cfg["_matched_message"] = (msg.content or "")[:2000]
+                cfg["_matched_message"] = (msg.content or "")
                 cfg["_matched_from"] = str(actor_id)
                 cfg["_matched_message_id"] = str(msg.id)
                 cfg["_matched_session_id"] = watch_session_id
@@ -482,7 +482,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
-                cfg["_matched_message"] = (msg.content or "")[:2000]
+                cfg["_matched_message"] = (msg.content or "")
                 cfg["_matched_from"] = str(actor_id)
                 cfg["_matched_message_id"] = str(msg.id)
                 cfg["_matched_session_id"] = str(msg.conversation_id)
@@ -509,7 +509,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
-                cfg["_matched_message"] = (msg.content or "")[:2000]
+                cfg["_matched_message"] = (msg.content or "")
                 cfg["_matched_from"] = str(actor_id)
                 cfg["_matched_message_id"] = str(msg.id)
                 cfg["_matched_session_id"] = str(msg.conversation_id)

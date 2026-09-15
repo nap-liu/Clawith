@@ -267,7 +267,7 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
-                cfg["_matched_message"] = (msg.content or "")[:2000]
+                cfg["_matched_message"] = (msg.content or "")
                 cfg["_matched_from"] = from_agent_name
                 return True
 
@@ -342,7 +342,7 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
-                cfg["_matched_message"] = (msg.content or "")[:2000]
+                cfg["_matched_message"] = (msg.content or "")
                 cfg["_matched_from"] = from_user_name
                 return True
 

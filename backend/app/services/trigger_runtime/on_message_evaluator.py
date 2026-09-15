@@ -144,7 +144,7 @@ async def match_incoming_chat_message(db, message, session) -> OnMessageMatchRes
         cfg = trigger.config or {}
         runtime_cfg = {
             **cfg,
-            "_matched_message": (message.content or "")[:2000],
+            "_matched_message": (message.content or ""),
             "_matched_from": actual_actor or "message",
             "_matched_message_id": str(message.id),
             "_matched_session_id": str(session.id),
@@ -456,7 +456,7 @@ async def recover_legacy_on_message_events(
             for message in rows:
                 runtime_cfg = {
                     **cfg,
-                    "_matched_message": (message.content or "")[:2000],
+                    "_matched_message": (message.content or ""),
                     "_matched_from": matched_from,
                     "_matched_message_id": str(message.id),
                     "_matched_session_id": str(message.conversation_id),

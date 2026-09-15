@@ -1,5 +1,7 @@
 """Core workspace, scheduling, and delivery tool schemas."""
 
+from app.services.trigger_tool_contract import TRIGGER_FUNCTIONS
+
 from app.services.media_tool_contract import SEND_MEDIA_FUNCTION_TOOL
 from app.services.agent_self_settings_tool import UPDATE_SELF_SETTINGS_FUNCTION_TOOL
 
@@ -331,113 +333,7 @@ AGENT_TOOL_CORE = [
         },
     },
     # --- Trigger management tools (Aware engine) ---
-    {
-        "type": "function",
-        "function": {
-            "name": "set_trigger",
-            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or human replies — identify exactly one actor with from_agent_id or from_user_id), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.). For type=webhook you can also set webhook_mode to control how bursts of rapid triggers are handled — see the webhook_mode parameter.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Unique name for this trigger, e.g. 'daily_briefing' or 'wait_<name>_reply'",
-                    },
-                    "type": {
-                        "type": "string",
-                        "enum": ["cron", "once", "interval", "poll", "on_message", "webhook"],
-                        "description": "Trigger type",
-                    },
-                    "config": {
-                        "type": "object",
-                        "description": 'Type-specific config. cron: {"expr": "0 9 * * *", "timezone": "optional IANA name"}. once: {"at": "2026-03-10T09:00:00"}; an offset is honored when present, otherwise the effective Agent timezone is used. interval: {"minutes": 30}. poll: {"url": "...", "json_path": "$.status", "fire_on": "change", "interval_min": 5}. on_message must contain exactly one canonical actor: {"from_agent_id": "<agent_id>"} or {"from_user_id": "<user_id>"}. webhook: {"secret": "optional_hmac_secret"} (system auto-generates the URL)',
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "What you should do when this trigger fires. This will be shown to you as context when you wake up.",
-                    },
-                    "focus_ref": {
-                        "type": "string",
-                        "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason.",
-                    },
-                    "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Omit to inherit the Agent model."},
-                    "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override. Omit to inherit the Digital Employee setting."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning override. none disables thinking; omit to inherit."},
-                    "soul": {"type": "boolean", "default": True, "description": "Whether to use the Agent's Soul for this trigger."},
-                    "memory": {"type": "boolean", "default": True, "description": "Whether to use the Agent's memory for this trigger."},
-                    "webhook_mode": {
-                        "type": "string",
-                        "enum": ["legacy", "queue", "merge"],
-                        "description": "Webhook processing mode (type=webhook only). Every authenticated submission accepted by the endpoint is stored byte-for-byte in this agent's webhook/ inbox; the wake context provides its event ID, millisecond timestamp, file path, size, and SHA-256, and you should read the referenced file before processing it. legacy (default) wakes from only the newest event while older inbox files remain discoverable. queue wakes once per event in FIFO order. merge wakes once for the batch captured when execution starts. Choose the mode when creating the trigger; if changing it later, briefly pause upstream submissions and do not switch during an active webhook run.",
-                    },
-                },
-                "required": ["name", "type", "config", "reason"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_trigger",
-            "description": "Update an existing trigger's configuration or reason. Use this to adjust timing, change parameters, etc. For example, change interval from 5 minutes to 30 minutes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the trigger to update",
-                    },
-                    "config": {
-                        "type": "object",
-                        "description": "New config. once.at accepts ISO 8601; values without an offset use the effective Agent timezone. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged.",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "New reason text",
-                    },
-                    "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Empty means inherit the Agent model."},
-                    "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning override. none disables thinking."},
-                    "soul": {"type": "boolean", "description": "Whether to use the Agent's Soul."},
-                    "memory": {"type": "boolean", "description": "Whether to use the Agent's memory."},
-                    "webhook_mode": {
-                        "type": "string",
-                        "enum": ["legacy", "queue", "merge"],
-                        "description": "For an existing webhook trigger only. Briefly pause upstream submissions and switch only when no webhook run is active and no event is pending or queued. The change is immediate and affects subsequent scheduling; it does not convert or drain in-flight work. The existing URL token, secret, and stored webhook inbox files remain unchanged. legacy uses the newest event, queue processes FIFO, and merge processes the batch captured when execution starts.",
-                    },
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_trigger",
-            "description": "Cancel (disable) a trigger by name. Use this when a task is completed and the trigger is no longer needed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the trigger to cancel",
-                    },
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_triggers",
-            "description": "List all your triggers, including each trigger's creator and execution user IDs.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    },
+    *TRIGGER_FUNCTIONS,
     {
         "type": "function",
         "function": {

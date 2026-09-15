@@ -58,7 +58,7 @@ async def test_check_new_agent_messages_matches_user_role():
     source_agent_id = uuid.uuid4()
     # Mock chat message
     chat_message = MagicMock()
-    chat_message.content = "Designed the logo"
+    chat_message.content = "Designed the logo" * 300 + " END_SENTINEL"
     chat_message.role = "user"  # Role is user
 
     trigger = AgentTrigger(
@@ -83,5 +83,5 @@ async def test_check_new_agent_messages_matches_user_role():
         result = await check_new_agent_messages(trigger)
 
     assert result is True
-    assert trigger.config["_matched_message"] == "Designed the logo"
+    assert trigger.config["_matched_message"] == chat_message.content
     assert trigger.config["_matched_from"] == str(source_agent_id)

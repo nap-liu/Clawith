@@ -46,6 +46,8 @@ class TriggerResponse(BaseModel):
 
 class TriggerUpdate(BaseModel):
     config: dict | None = None
+    clear_fields: list[str] = []
+    focus_ref: str | None = None
     reason: str | None = None
     is_enabled: bool | None = None
     max_fires: int | None = None
@@ -114,39 +116,6 @@ def _member_visible_config(trigger_type: str, value: object) -> dict:
         "interval": ("minutes",),
     }.get(trigger_type, ())
     return {key: value[key] for key in safe_keys if key in value}
-
-
-def _contains_private_config(value) -> bool:
-    if isinstance(value, dict):
-        return any(
-            _is_private_config_key(key) or _contains_private_config(item)
-            for key, item in value.items()
-        )
-    return isinstance(value, list) and any(_contains_private_config(item) for item in value)
-
-
-def _private_config(value):
-    if not isinstance(value, dict):
-        return {}
-    private = {}
-    for key, item in value.items():
-        if _is_private_config_key(key):
-            private[key] = item
-        elif isinstance(item, dict):
-            nested = _private_config(item)
-            if nested:
-                private[key] = nested
-    return private
-
-
-def _merge_private_config(public, private):
-    merged = dict(public)
-    for key, value in private.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _merge_private_config(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
 
 
 async def _require_manage(db, user, agent_id: uuid.UUID) -> None:
@@ -286,7 +255,7 @@ async def update_trigger(
             select(AgentTrigger).where(
                 AgentTrigger.id == trigger_id,
                 AgentTrigger.agent_id == agent_id,
-            )
+            ).with_for_update()
         )
         trigger = result.scalar_one_or_none()
         if not trigger:
@@ -303,7 +272,7 @@ async def update_trigger(
                 raise HTTPException(422, str(exc)) from exc
 
         changed_fields = body.model_fields_set
-        if trigger.is_system and changed_fields - {
+        if trigger.is_system and (changed_fields - {"clear_fields"}) - {
             "is_enabled",
             "execution_user_id",
             "expected_execution_user_id",
@@ -317,6 +286,16 @@ async def update_trigger(
                 403,
                 "System triggers can only be enabled/disabled or reassigned by an Agent manager",
             )
+
+        from app.services.trigger_patch import prepare_patch, resolve_patch_recipient, apply_patch, serialize_trigger, check_enable_limit, recover_enabled_trigger
+        from app.services.timezone_utils import get_agent_timezone
+        patch = body.model_dump(exclude_unset=True, exclude={"execution_user_id", "expected_execution_user_id"})
+        try:
+            values = prepare_patch(trigger, patch, await get_agent_timezone(agent_id), private_key=_is_private_config_key)
+            await resolve_patch_recipient(db, agent_id, trigger, values)
+            await check_enable_limit(db, trigger, values)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
         identity_reassigned = False
         if "execution_user_id" in changed_fields:
@@ -363,40 +342,12 @@ async def update_trigger(
                 execution_user_id=user.id,
             )
 
-        if body.config is not None:
-            if _contains_private_config(body.config):
-                raise HTTPException(422, "Trigger config contains reserved internal fields")
-            trigger.config = _merge_private_config(
-                body.config,
-                _private_config(trigger.config or {}),
-            )
-        if body.reason is not None:
-            trigger.reason = body.reason
-        if body.is_enabled is not None:
-            trigger.is_enabled = body.is_enabled
-        if body.max_fires is not None:
-            trigger.max_fires = body.max_fires
-        if body.cooldown_seconds is not None:
-            trigger.cooldown_seconds = body.cooldown_seconds
-        if body.expires_at is not None:
-            from datetime import datetime
-            trigger.expires_at = datetime.fromisoformat(body.expires_at)
-        if "model_id" in changed_fields:
-            trigger.model_id = body.model_id
-        if "temperature" in changed_fields:
-            if body.temperature is not None and not 0 <= body.temperature <= 2:
-                raise HTTPException(422, "temperature must be between 0 and 2")
-            trigger.temperature = body.temperature
-        if "reasoning_effort" in changed_fields:
-            trigger.reasoning_effort = body.reasoning_effort
-        if "soul" in changed_fields:
-            trigger.soul = body.soul
-        if "memory" in changed_fields:
-            trigger.memory = body.memory
+        apply_patch(trigger, values)
 
         await db.commit()
+        await recover_enabled_trigger(trigger, values)
 
-    return {"ok": True}
+    return {"ok": True, "trigger": serialize_trigger(trigger, config_projector=_public_config)}
 
 
 @router.delete("/{agent_id}/triggers/{trigger_id}")
