@@ -124,3 +124,20 @@
     -webkit-user-select: none;
     user-select: none;
 }
+
+.chat-file-delivery--inline-image .chat-file-delivery__body {
+    flex-wrap: wrap;
+}
+
+.chat-file-delivery--inline-image .chat-file-delivery__thumb--image {
+    flex: 0 0 100%;
+    width: 100%;
+    height: auto;
+    max-height: 360px;
+}
+
+.chat-file-delivery--inline-image .chat-file-delivery__thumb--image img {
+    height: auto;
+    max-height: 360px;
+    object-fit: contain;
+}

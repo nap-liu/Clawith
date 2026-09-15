@@ -6,6 +6,8 @@ import SubagentRunCard, { parseSubagentRunCardData, type SubagentRunCardData } f
 import { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } from '../utils/chatFileDelivery';
 import type { ChatFileDelivery, ChatMediaDeliveryError } from '../utils/chatFileDelivery';
 import type { ChatPreviewImage } from '../utils/chatAttachments';
+import ChatToolResultCard from './ChatToolResultCard';
+import type { ToolResultDisplay } from '../utils/chatToolResult';
 
 type ToolCallRenderContext = {
     message: any;
@@ -44,6 +46,16 @@ function toolName(context: ToolCallRenderContext): string {
 }
 
 const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
+    {
+        type: 'tool-result',
+        resolve: ({ message }) => message.toolResultContent?.hasMedia ? message.toolResultContent : null,
+        render: ({ agentId, mode, onPreviewImages }, { message, payload }, data) => (
+            <ChatToolResultCard agentId={agentId} mode={mode} result={data as ToolResultDisplay}
+                messageId={String(message.persistedMessageId || message.id || '')}
+                name={message.toolName || payload.name || ''} args={message.toolArgs ?? payload.args}
+                onPreviewImages={onPreviewImages} />
+        ),
+    },
     {
         type: 'run-subagent',
         resolve: (context) => {

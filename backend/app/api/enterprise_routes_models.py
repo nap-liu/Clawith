@@ -184,6 +184,7 @@ async def add_llm_model(
     model = LLMModel(
         provider=data.provider,
         api_protocol=data.api_protocol,
+        tool_result_multimodal_mode=data.tool_result_multimodal_mode,
         purposes=list(dict.fromkeys(data.purposes)),
         input_modalities=list(dict.fromkeys(data.input_modalities or (["text", "image"] if data.supports_vision else ["text"]))),
         model=data.model,
@@ -371,6 +372,8 @@ async def update_llm_model(
     try:
         if "api_protocol" in data.model_fields_set:
             model.api_protocol = data.api_protocol
+        if "tool_result_multimodal_mode" in data.model_fields_set:
+            model.tool_result_multimodal_mode = data.tool_result_multimodal_mode or "auto"
         if "extra_headers" in data.model_fields_set:
             model.extra_headers_encrypted = encrypt_model_headers(data.extra_headers)
         if data.purposes is not None:

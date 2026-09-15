@@ -356,6 +356,44 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
 
 ## Security and history
 
+Tool results use the MCP `CallToolResult` content contract. HTTP, proxy and
+sandbox stdio MCP adapters preserve `content`, `structuredContent`, `isError`
+and metadata instead of flattening media into placeholder strings. Existing
+plain-text tools remain compatible. CDP screenshots return ordinary text and
+an image block; this adds no model-visible tool or AgentBay dependency.
+
+The shared caller stores standard results on the existing tool-call row.
+Inline image/audio/embedded binary resources become immutable content-addressed
+files under the execution Agent's `.tool_results/` directory, with standard
+resource links retained in the result. `agent-file` URIs resolve only within
+that directory and the active Agent workspace; external resources use the
+existing URL policy. Writes validate the Agent workspace boundary before storage.
+Private MCP metadata is excluded from inference and summary text; content audience
+annotations apply to both text and media. Textual views keep the ordinary output
+budget. Unreadable or unsupported content is explicit per resource.
+
+`LLMModel.tool_result_multimodal_mode` selects `auto`, `native` or `user_message`
+and travels in the immutable runtime snapshot. Auto uses Anthropic native
+results and otherwise the user-message compatibility projection. Responses
+native image/file output and compatible user image/audio/video inputs are
+translated at the provider boundary; actual model modality support still applies.
+Compatibility observations follow the complete assistant/tool batch and retain
+source call IDs. They are never persisted as human messages, admitted as new
+Turns, passed to user-message triggers or included in Turn partitioning. Live
+execution and recovered history share the projection. Changing protocols does
+not change the durable result or replay an executed tool.
+
+The backend projects standard tool results into the existing Web text/attachment
+contract, identically for live events and history. Frontend cards only render this
+typed display data; MCP resource, URI, MIME and audience normalization stays in
+the backend. This display projection never replaces the durable result. Images
+use the shared file preview/lightbox; audio and video use the shared media
+player. Live events carry the durable result-row ID, and history keeps that ID
+separate from the model call ID. Protected playback checks the resource path
+against that row and the viewer's session access. Inline binaries and stored
+resource links share this renderer; no tool-name-specific screenshot UI or IM
+delivery change is required.
+
 - Tool execution permissions and session visibility are separate checks.
 - Persist truthful tool errors and results; do not replace them with fabricated success or prompt-only patches.
 - Sanitization for display/logging must not mutate durable tool results replayed to the LLM.

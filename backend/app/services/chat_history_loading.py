@@ -311,6 +311,7 @@ def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
         "args": args,
         "status": data.get("status"),
         "result": data.get("result"),
+        "tool_result": data.get("tool_result"),
         "session_ref": data.get("session_ref"),
         "reasoning_content": data.get("reasoning_content"),
         "assistant_content": data.get("assistant_content"),
@@ -403,6 +404,7 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
         "role": "tool",
         "tool_call_id": tc_id,
         "content": sanitize_history_tool_result(str(result)),
+        "tool_result": payload.get("tool_result"),
     }
     return [*prefix_messages, asst, tool_msg]
 
@@ -468,6 +470,7 @@ def expand_tool_call_round(messages: list[Any]) -> list[dict[str, Any]]:
             "role": "tool",
             "tool_call_id": str(payload.get("call_id") or f"call_{message.id}"),
             "content": sanitize_history_tool_result(str(payload.get("result") or "")),
+            "tool_result": payload.get("tool_result"),
         }
         for message, payload in parsed
         if payload.get("status") == "done"

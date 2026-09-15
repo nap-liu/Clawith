@@ -22,7 +22,7 @@ async def test_call_tool_parses_envelope(monkeypatch):
                 "message": "ok",
                 "data": {"content": [
                     {"type": "text", "text": "part1"},
-                    {"type": "image", "url": "..."},
+                    {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="},
                     {"type": "text", "text": "part2"},
                 ]},
             }
@@ -44,7 +44,8 @@ async def test_call_tool_parses_envelope(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
     c = SandboxMcpHubClient(base_url="http://aio-sandbox:8080", api_key=None)
     out = await c.call_tool("yx__abc", "get_current_user", {})
-    assert out == "part1\npart2"
+    assert out["content"] == FakeResp().json()["data"]["content"]
+    assert out["isError"] is False
     assert captured["url"].endswith("/v1/mcp/yx__abc/tools/get_current_user")
     assert captured["json"] == {}
     assert captured["params"] == {"timeout": 120.0}
@@ -70,7 +71,8 @@ async def test_call_tool_surfaces_failure(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
     out = await SandboxMcpHubClient("http://x:8080", None).call_tool("n", "t", {})
-    assert "boom" in out
+    assert out["isError"] is True
+    assert "boom" in out["content"][0]["text"]
 
 
 async def test_call_tool_with_api_key_sends_auth_header(monkeypatch):
@@ -180,7 +182,8 @@ async def test_call_tool_returns_error_string_on_network_error(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
     out = await SandboxMcpHubClient("http://x:8080", None).call_tool("srv", "tool", {})
-    assert out.startswith("❌")
+    assert out["isError"] is True
+    out = out["content"][0]["text"]
 
 
 async def test_call_tool_returns_error_string_on_502(monkeypatch):
@@ -208,6 +211,8 @@ async def test_call_tool_returns_error_string_on_502(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
     out = await SandboxMcpHubClient("http://x:8080", None).call_tool("srv", "tool", {})
+    assert out["isError"] is True
+    out = out["content"][0]["text"]
     assert "❌" in out
     assert "502" in out
 

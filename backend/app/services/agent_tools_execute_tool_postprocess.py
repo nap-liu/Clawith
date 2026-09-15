@@ -6,6 +6,7 @@ import uuid
 from loguru import logger
 
 from app.database import async_session
+from app.services.tool_results import tool_result_text
 
 _ROOT_TOOL_SYMBOLS = ("async_session", "logger")
 
@@ -33,7 +34,7 @@ async def execute_tool_postprocess(
         from app.utils.sanitize import sanitize_sensitive_values, sanitize_tool_args
 
         _log_args = sanitize_tool_args(arguments) or {}
-        _log_result = result
+        _log_result = tool_result_text(result)
         if tool_name == "list_installed_mcp_servers":
             try:
                 _log_result = json.dumps(

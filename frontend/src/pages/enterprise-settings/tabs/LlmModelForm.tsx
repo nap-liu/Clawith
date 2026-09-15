@@ -17,6 +17,7 @@ export interface PoolModel extends LlmModelListItem {
     label: string;
     base_url?: string;
     extra_headers?: Record<string, string> | null;
+    tool_result_multimodal_mode?: string;
     max_output_tokens?: number;
     request_timeout?: number;
     temperature?: number;
@@ -49,6 +50,7 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
     const [form, setForm] = useState({
         provider: model?.provider || defaultSpec?.provider || 'openai',
         api_protocol: model?.api_protocol || (model ? '' : defaultSpec?.preferred_protocol || 'openai_responses'),
+        tool_result_multimodal_mode: model?.tool_result_multimodal_mode || 'auto',
         purposes: model?.purposes || ['conversation'],
         input_modalities: model?.input_modalities || (model?.supports_vision ? ['text', 'image'] : ['text']),
         model: model?.model || '',
@@ -186,6 +188,15 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
             <SettingsSection title={t('enterprise.llm.capabilitySettings')}>
                 {multi('purposes', MODEL_PURPOSES, 'enterprise.llm.purposesLabel', 'enterprise.llm.purposes')}
                 {multi('input_modalities', INPUT_MODALITIES, 'enterprise.llm.modalitiesLabel', 'enterprise.llm.modalities')}
+                {canChat && <SettingsField htmlFor={`${formId}-tool-result-mode`} label={t('enterprise.llm.toolResultMultimodalMode')}
+                    hint={t('enterprise.llm.toolResultMultimodalHint')}>
+                    <SelectDropdown value={form.tool_result_multimodal_mode} disabled={busy} style={{ width: '100%' }}
+                        options={['auto', 'native', 'user_message'].map(value => ({
+                            value, label: t(`enterprise.llm.toolResultMultimodalModes.${value}`),
+                        }))}
+                        onChange={tool_result_multimodal_mode => update({ tool_result_multimodal_mode })}
+                        ariaLabel={t('enterprise.llm.toolResultMultimodalMode')} />
+                </SettingsField>}
             </SettingsSection>
             {canChat && <SettingsSection title={t('enterprise.llm.responseSettings')}>
                 <div className="settings-field-grid">

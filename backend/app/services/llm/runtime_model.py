@@ -37,6 +37,7 @@ class RuntimeLLMModel:
     reasoning_effort: str | None = None
     compact_stream: bool = False
     api_protocol: str | None = None
+    tool_result_multimodal_mode: str = "auto"
     purposes: tuple[str, ...] = ("conversation",)
     input_modalities: tuple[str, ...] = ("text",)
     extra_headers_encrypted: str | None = None
@@ -50,6 +51,7 @@ class RuntimeLLMModel:
             tenant_id=model.tenant_id,
             provider=model.provider,
             api_protocol=getattr(model, "api_protocol", None) if isinstance(getattr(model, "api_protocol", None), str) else None,
+            tool_result_multimodal_mode=getattr(model, "tool_result_multimodal_mode", None) or "auto",
             purposes=tuple(model_purposes(model)),
             input_modalities=tuple(model_modalities(model)),
             model=model.model,

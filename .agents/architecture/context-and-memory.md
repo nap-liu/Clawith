@@ -70,6 +70,18 @@ Display/log sanitization must not poison the durable result later replayed to
 the model. Exact file paths and stage-specific storage/parser errors remain
 visible; do not collapse them into a false “not found” or canned success.
 
+Tool multimodal compatibility is a final provider projection, after canonical
+history assembly and compaction. A projected user-role observation belongs to
+the preceding tool batch, never a new user turn. Durable tool result resources
+are reloaded from their original rows during recovery; they do not depend on an
+in-memory cache or a previously generated provider URL.
+Replay preserves the saved bounded model text rather than regenerating it from
+the full standard result. Projection does not mutate earlier messages or Responses
+snapshots. Chat serialization omits empty assistant content on tool calls in both
+live and reloaded history, preserving the same wire prefix across tool rounds.
+Private MCP metadata and user-only content are excluded from summary input as
+well as ordinary inference; Web display uses an independent backend projection.
+
 ## Scene prompt blocks
 
 Each scene system-prompt block accepts up to 30,000 characters through the

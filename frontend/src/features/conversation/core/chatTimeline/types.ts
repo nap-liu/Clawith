@@ -18,10 +18,12 @@ export type ConversationMessage = {
   attachments?: ChatMessageAttachment[];
   quoted_message?: ChatQuotedMessage;
   toolCallId?: string;
+  persistedMessageId?: string;
   toolName?: string;
   toolArgs?: any;
   toolStatus?: ConversationToolStatus;
   toolResult?: string;
+  toolResultContent?: import('../../../../utils/chatToolResult').ToolResultDisplay;
   toolSessionRef?: { session_id: string; execution_agent_id: string };
   toolThinking?: string;
   mediaTaskId?: string;

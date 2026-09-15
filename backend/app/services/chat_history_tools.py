@@ -90,6 +90,7 @@ async def persist_tool_call_row(
             "args": evt.get("args"),
             "status": status,
             "result": evt.get("result") or "",
+            **({"tool_result": evt["tool_result"]} if evt.get("tool_result") is not None else {}),
             **({"session_ref": evt["session_ref"]} if evt.get("session_ref") else {}),
             "reasoning_content": evt.get("reasoning_content"),
             "assistant_content": evt.get("assistant_content"),

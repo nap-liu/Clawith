@@ -418,7 +418,7 @@ async def _web_screenshot(
     *,
     user_id: Optional[uuid.UUID] = None,
     session_id: Optional[str] = None,
-) -> str:
+) -> str | dict:
     """Capture a PNG of the conversation's persistent RPA page into the workspace."""
     try:
         backend, cfg = await _resolve_sandbox_backend(agent_id, "web_screenshot")
@@ -434,11 +434,19 @@ async def _web_screenshot(
     b64 = result.get("screenshot_b64")
     if not b64:
         return "❌ web_screenshot: no image returned."
-    name = f"web-screenshot-{uuid.uuid4().hex[:8]}.png"
+    name = f"workspace/web-screenshot-{uuid.uuid4().hex[:8]}.png"
     try:
-        (ws / name).write_bytes(base64.b64decode(b64))
+        target = ws / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(b64))
     except Exception as e:  # noqa: BLE001
         return f"❌ web_screenshot: save failed: {str(e)[:100]}"
-    return f"Screenshot saved to workspace: {name}"
+    return {
+        "content": [
+            {"type": "text", "text": f"Screenshot saved to workspace: {name}"},
+            {"type": "image", "mimeType": "image/png", "data": b64},
+        ],
+        "isError": False,
+    }
 
 __all__ = [name for name in globals() if not name.startswith("__")]

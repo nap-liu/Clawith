@@ -1,4 +1,5 @@
 import { IconDownload, IconPhoto } from '@tabler/icons-react';
+import { useTranslation } from 'react-i18next';
 import { fileApi } from '../services/api';
 import { isPreviewableImageName, type ChatPreviewImage } from '../utils/chatAttachments';
 import type { ChatFileDelivery } from '../utils/chatFileDelivery';
@@ -12,6 +13,7 @@ type Props = {
     messageId: string;
     delivery: ChatFileDelivery;
     mode?: 'pc' | 'h5';
+    inlineImage?: boolean;
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
 };
 
@@ -25,13 +27,15 @@ export default function ChatFileDeliveryCard({
     messageId,
     delivery,
     mode = 'pc',
+    inlineImage = false,
     onPreviewImages,
 }: Props) {
+    const { t } = useTranslation();
     const downloadUrl = delivery.url
         || (agentId && delivery.path ? fileApi.downloadUrl(agentId, delivery.path) : '');
     const previewUrl = agentId && delivery.path
         ? fileApi.downloadUrl(agentId, delivery.path, { inline: true })
-        : '';
+        : delivery.url || '';
     const isImage = isImageDelivery(delivery);
     const protectImage = mode === 'h5' && isImage;
     const mediaKind = delivery.mediaKind
@@ -78,7 +82,7 @@ export default function ChatFileDeliveryCard({
     }
 
     return (
-        <div className={`chat-file-delivery chat-file-delivery--${mode}`}>
+        <div className={`chat-file-delivery chat-file-delivery--${mode}${inlineImage && isImage ? ' chat-file-delivery--inline-image' : ''}`}>
             {delivery.message ? (
                 <div className="chat-file-delivery__message">{delivery.message}</div>
             ) : null}
@@ -88,13 +92,14 @@ export default function ChatFileDeliveryCard({
                         type="button"
                         className="chat-file-delivery__thumb chat-file-delivery__thumb--image"
                         onClick={openPreview}
-                        aria-label="预览图片"
+                        aria-label={t('toolResult.previewImage')}
                     >
                         <img
                             src={previewUrl}
                             alt={delivery.filename}
                             loading="lazy"
                             draggable={!protectImage}
+                            referrerPolicy="no-referrer"
                         />
                     </button>
                 ) : (
@@ -120,8 +125,8 @@ export default function ChatFileDeliveryCard({
                         className="chat-file-delivery__download"
                         href={downloadUrl}
                         download={delivery.filename}
-                        aria-label="下载文件"
-                        title="下载文件"
+                        aria-label={t('toolResult.downloadFile')}
+                        title={t('toolResult.downloadFile')}
                     >
                         <IconDownload size={18} stroke={1.8} />
                     </a>

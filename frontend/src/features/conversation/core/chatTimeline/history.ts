@@ -90,6 +90,7 @@ export function mapHistoryMessage(
       content: parsed.name ? "" : raw.content || "",
       created_at: raw.created_at || null,
       toolCallId: String(raw.toolCallId || parsed.call_id || parsed.id || id),
+      persistedMessageId: raw.persistedMessageId || raw.id,
       _toolCallIdExplicit:
         typeof raw.toolCallIdExplicit === "boolean"
           ? raw.toolCallIdExplicit
@@ -98,6 +99,7 @@ export function mapHistoryMessage(
       toolArgs,
       toolStatus: normalizeToolStatus(raw.toolStatus || parsed.status),
       toolResult: normalizeToolResult(raw.toolResult ?? parsed.result) || "",
+      toolResultContent: raw.toolResultContent,
       toolSessionRef: raw.toolSessionRef ?? parsed.session_ref,
       toolThinking: raw.toolThinking || parsed.reasoning_content || "",
       mediaTaskId: raw.mediaTaskId || undefined,

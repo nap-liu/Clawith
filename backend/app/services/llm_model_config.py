@@ -64,6 +64,7 @@ async def clone_tenant_llm_model(
         tenant_id=tenant_id,
         provider=source.provider,
         api_protocol=source.api_protocol,
+        tool_result_multimodal_mode=source.tool_result_multimodal_mode,
         purposes=list(source.purposes or ["conversation"]),
         input_modalities=list(source.input_modalities or (["text", "image"] if source.supports_vision else ["text"])),
         model=normalized_model,

@@ -13,6 +13,7 @@ import json
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from loguru import logger
+from app.services.tool_results import normalize_tool_result
 
 
 class MCPClient:
@@ -391,7 +392,7 @@ class MCPClient:
         except httpx.HTTPError as e:
             raise Exception(f"Connection failed: {str(e)[:200]}")
 
-    async def call_tool(self, tool_name: str, arguments: dict) -> str:
+    async def call_tool(self, tool_name: str, arguments: dict) -> dict:
         """Execute a tool on the MCP server."""
         try:
             data = await self._detect_and_request(
@@ -402,29 +403,9 @@ class MCPClient:
             if "error" in data:
                 err = data["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                return f"❌ MCP tool execution error: {msg[:200]}"
+                return normalize_tool_result(f"❌ MCP tool execution error: {msg[:200]}", is_error=True)
 
-            result = data.get("result", {})
-            if isinstance(result, str):
-                return result
-
-            # MCP returns content as list of content blocks
-            content_blocks = result.get("content", []) if isinstance(result, dict) else []
-            texts = []
-            for block in content_blocks:
-                if isinstance(block, str):
-                    texts.append(block)
-                elif isinstance(block, dict):
-                    if block.get("type") == "text":
-                        texts.append(block.get("text", ""))
-                    elif block.get("type") == "image":
-                        texts.append(f"[Image: {block.get('mimeType', 'image')}]")
-                    else:
-                        texts.append(str(block))
-                else:
-                    texts.append(str(block))
-
-            return "\n".join(texts) if texts else str(result)
+            return normalize_tool_result(data.get("result", {}))
 
         except httpx.HTTPError as e:
-            return f"❌ MCP connection failed: {str(e)[:200]}"
+            return normalize_tool_result(f"❌ MCP connection failed: {str(e)[:200]}", is_error=True)

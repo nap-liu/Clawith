@@ -1,4 +1,25 @@
 {
+  "toolResult": {
+    "title": "Tool result",
+    "failed": "Execution failed",
+    "image": "Image {{index}}",
+    "audio": "Audio {{index}}",
+    "video": "Video {{index}}",
+    "file": "File {{index}}",
+    "unavailable": "This content cannot be previewed",
+    "previewImage": "Preview image",
+    "downloadFile": "Download file",
+    "downloadMedia": "Download media",
+    "playVideo": "Play video",
+    "playAudio": "Play audio",
+    "loadingPlayback": "Requesting playback access…",
+    "reload": "Reload",
+    "playbackError": "Media is temporarily unavailable",
+    "externalPlaybackError": "Media cannot be played. Check the source or try again later",
+    "playbackInterrupted": "Playback interrupted. Please reload",
+    "unsupportedFormat": "This browser does not support the media format. Download it to play",
+    "sourceUnavailable": "Media source is unavailable. Reload or download the file"
+  },
   "unsavedChanges": {
     "title": "Discard unsaved changes?",
     "message": "You have unsaved changes. Leave this page?",
@@ -3825,6 +3846,9 @@
       "runningAgents": "{{running}}/{{total}} running"
     },
     "llm": {
+            "toolResultMultimodalMode": "Multimodal tool result input",
+            "toolResultMultimodalHint": "Automatically submit tool media as native results or user messages. Supported media types depend on the model and provider.",
+            "toolResultMultimodalModes": {"auto": "Auto", "native": "Native tool result", "user_message": "User message compatibility"},
       "addModel": "Add Model",
       "noModels": "No data",
       "provider": "Provider",

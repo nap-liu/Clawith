@@ -1,5 +1,6 @@
 from app.services.llm.compactor_shared import *  # noqa: F401,F403
 from app.services.llm.compactor_summary import _objective_evidence_items
+from app.services.tool_results import tool_result_text
 
 def _media_reference_context(meta: dict) -> str:
     request = meta.get("media_request") or {}
@@ -93,6 +94,10 @@ def serialize_span_for_summary(
             except (TypeError, ValueError, json.JSONDecodeError):
                 tool_payload = None
             if isinstance(tool_payload, dict) and tool_payload.get("status") == "done":
+                standard_result = tool_payload.pop("tool_result", None)
+                if isinstance(standard_result, dict):
+                    tool_payload["result"] = tool_result_text(standard_result)
+                    body = json.dumps(tool_payload, ensure_ascii=False)
                 result = tool_payload.get("result")
                 durable_tool_output = bool(
                     isinstance(result, str)

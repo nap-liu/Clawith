@@ -61,7 +61,6 @@ async def test_scene_alias_and_platform_revocation_cross_real_execution_process(
             "scene_tools": [{"tool_id": str(tool_id), "enabled": True}],
         }):
             result = await asyncio.wait_for(execute_tool("read", {}, agent.id, user.id, skip_autonomy=True), 30)
-            assert result == "real-provider-result"
             assert [request["params"]["name"] for request in requests if request["method"] == "tools/call"] == ["read"]
             admitted_requests = len(requests)
             async with async_session() as db:

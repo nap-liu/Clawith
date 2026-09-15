@@ -6,9 +6,10 @@ import json
 import uuid
 
 from fastapi import APIRouter, Header, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from app.services.agent_tools import execute_tool
+from app.services.tool_results import normalize_tool_result
 from app.services.turn_tool_settings import restore_turn_tool_settings
 from app.services.toolscall.capability import (
     ToolscallUnavailable,
@@ -89,6 +90,8 @@ async def call_tool(
             tool_call_id=nested_call_id,
             turn_anchor_id=turn_anchor_id,
         )
+    if isinstance(result, dict):
+        return JSONResponse(normalize_tool_result(result))
     if not isinstance(result, str):
         return _protocol_error("tool executor returned a non-text result", 500)
     return Response(content=result.encode("utf-8"), media_type="text/plain")

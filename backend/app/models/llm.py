@@ -28,12 +28,17 @@ class LLMModel(Base):
             "('none','minimal','low','medium','high','xhigh','max')",
             name="ck_llm_models_reasoning_effort",
         ),
+        CheckConstraint(
+            "tool_result_multimodal_mode IN ('auto','native','user_message')",
+            name="ck_llm_models_tool_result_multimodal_mode",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True, index=True)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)  # anthropic, openai, deepseek, etc.
     api_protocol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tool_result_multimodal_mode: Mapped[str] = mapped_column(String(16), default="auto", server_default="auto")
     purposes: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=lambda: ["conversation"], server_default='["conversation"]')
     input_modalities: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=lambda: ["text"], server_default='["text"]')
     model: Mapped[str] = mapped_column(String(100), nullable=False)  # claude-opus-4-6, gpt-4o, etc.

@@ -1,4 +1,25 @@
 {
+  "toolResult": {
+    "title": "工具结果",
+    "failed": "执行失败",
+    "image": "图片 {{index}}",
+    "audio": "音频 {{index}}",
+    "video": "视频 {{index}}",
+    "file": "文件 {{index}}",
+    "unavailable": "此内容暂时无法预览",
+    "previewImage": "预览图片",
+    "downloadFile": "下载文件",
+    "downloadMedia": "下载媒体",
+    "playVideo": "播放视频",
+    "playAudio": "播放音频",
+    "loadingPlayback": "正在获取播放权限…",
+    "reload": "重新加载",
+    "playbackError": "媒体暂时无法播放",
+    "externalPlaybackError": "媒体暂时无法播放，请检查源地址或稍后重试",
+    "playbackInterrupted": "播放中断，请重新加载",
+    "unsupportedFormat": "当前浏览器不支持此媒体格式，可下载后播放",
+    "sourceUnavailable": "媒体源暂时无法播放，请重新加载或下载文件"
+  },
   "unsavedChanges": {
     "title": "放弃未保存修改？",
     "message": "当前有未保存的修改，是否离开？",
@@ -3866,6 +3887,9 @@
       "runningAgents": "{{running}}/{{total}} 运行中"
     },
     "llm": {
+            "toolResultMultimodalMode": "工具多模态结果输入方式",
+            "toolResultMultimodalHint": "自动选择原生或用户消息方式传入工具生成的媒体。实际支持的媒体类型由模型和服务商决定。",
+            "toolResultMultimodalModes": {"auto": "自动", "native": "原生工具结果", "user_message": "用户消息兼容"},
       "addModel": "添加模型",
       "noModels": "暂无数据",
       "provider": "提供商",

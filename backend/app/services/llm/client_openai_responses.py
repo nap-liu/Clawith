@@ -73,6 +73,8 @@ class OpenAIResponsesClient(LLMClient):
                 img = part.get("image_url", {})
                 if isinstance(img, dict):
                     formatted.append({"type": "input_image", "image_url": img.get("url", "")})
+            elif ptype == "file":
+                formatted.append({"type": "input_file", **part["file"]})
             else:
                 formatted.append(part)
         return formatted if formatted else content
@@ -141,7 +143,7 @@ class OpenAIResponsesClient(LLMClient):
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": msg.tool_call_id or "",
-                    "output": msg.content or "",
+                    "output": self._format_content_for_input(msg.content) if isinstance(msg.content, list) else msg.content or "",
                 })
 
         # Sanitize: ensure every function_call_output has a matching function_call.

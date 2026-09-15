@@ -627,11 +627,14 @@ async def _call_agent_llm(
         # Mirror to web viewers, masking secrets at the output boundary exactly
         # like the WebSocket path (raw args stay in the persisted row for replay).
         from app.utils.sanitize import sanitize_tool_args
+        from app.services.tool_result_display import tool_event_for_display
 
         _evt = (
             {**public_evt, "args": sanitize_tool_args(public_evt.get("args"))} if "args" in public_evt else public_evt
         )
-        await _web_broadcast({"type": "tool_call", **_evt})
+        await _web_broadcast({"type": "tool_call", **tool_event_for_display({
+            **_evt, "_durable_message_id": durable_message_id,
+        })})
         await run_channel_reaction_hook(
             on_tool_call,
             public_evt,

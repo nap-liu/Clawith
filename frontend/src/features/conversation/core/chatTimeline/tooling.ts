@@ -121,7 +121,9 @@ export function mergeToolCallProjection(
         ? primaryArgs
         : secondaryArgs,
     toolStatus: selectedStatus,
+    persistedMessageId: primary.persistedMessageId ?? secondary.persistedMessageId,
     toolResult: primaryResult || secondaryResult || "",
+    toolResultContent: primary.toolResultContent ?? secondary.toolResultContent,
     toolSessionRef: primary.toolSessionRef ?? primaryParsed.session_ref
       ?? secondary.toolSessionRef ?? secondaryParsed.session_ref,
     streaming:
@@ -176,11 +178,13 @@ export function toolCallMessageFromEvent(
     created_at: now,
     streaming: status === "running",
     toolCallId: callId,
+    persistedMessageId: data.persistedMessageId,
     _toolCallIdExplicit: Boolean(explicitCallId),
     toolName,
     toolArgs: parseToolArgs(data.args ?? data.toolArgs),
     toolStatus: status,
     toolResult: normalizeToolResult(data.result ?? data.toolResult) || "",
+    toolResultContent: data.toolResultContent,
     toolSessionRef: data.session_ref ?? data.toolSessionRef,
     toolThinking: data.reasoning_content || data.toolThinking || "",
     turnAnchorId,

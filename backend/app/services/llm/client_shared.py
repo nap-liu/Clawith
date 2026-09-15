@@ -79,6 +79,7 @@ class LLMMessage:
     reasoning_signature: str | None = None
     dynamic_content: str | None = None
     responses_snapshot: dict[str, Any] | None = None
+    tool_result: dict[str, Any] | None = None
 
     def to_openai_format(self) -> dict:
         """Convert to OpenAI format."""
@@ -88,6 +89,10 @@ class LLMMessage:
         if self.role == "system" and self.dynamic_content:
             content = f"{content}\n\n{self.dynamic_content}"
 
+        # Live tool calls use None; history preparation can yield an empty string.
+        # Keep the same wire prefix when replaying a completed tool round.
+        if self.role == "assistant" and self.tool_calls and content == "":
+            content = None
         if content is not None:
             msg["content"] = content
         if self.tool_calls:
@@ -130,6 +135,12 @@ class LLMMessage:
                                     "data": b64_data,
                                 }
                             })
+                    elif part.get("type") == "file":
+                        data_url = part["file"]["file_data"]
+                        header, data = data_url.split(",", 1)
+                        tool_content_blocks.append({"type": "document", "source": {
+                            "type": "base64", "media_type": header[5:].split(";")[0], "data": data,
+                        }})
                 result_content = tool_content_blocks if tool_content_blocks else (self.content or "")
             else:
                 result_content = self.content or ""
@@ -140,6 +151,7 @@ class LLMMessage:
                         "type": "tool_result",
                         "tool_use_id": self.tool_call_id,
                         "content": result_content,
+                        **({"is_error": True} if (self.tool_result or {}).get("isError") else {}),
                     }
                 ]
             }
@@ -172,6 +184,11 @@ class LLMMessage:
                                     "data": b64_data,
                                 }
                             })
+                    elif part.get("type") == "file":
+                        header, data = part["file"]["file_data"].split(",", 1)
+                        content_blocks.append({"type": "document", "source": {
+                            "type": "base64", "media_type": header[5:].split(";")[0], "data": data,
+                        }})
             else:
                 content_blocks.append({"type": "text", "text": self.content})
 

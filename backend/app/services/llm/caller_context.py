@@ -1,6 +1,7 @@
 """Caller context and tool-processing helpers."""
 
 from dataclasses import replace
+from app.services.tool_results import persist_tool_result, tool_result_text
 
 from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
@@ -603,6 +604,10 @@ async def _process_tool_call(
         tools_for_llm=tools_for_llm,
     )
     logger.info(f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}")
+    standard_result = None
+    if isinstance(result, dict):
+        standard_result = await persist_tool_result(result, agent_id=agent_id, session_id=session_id)
+        result = tool_result_text(standard_result)
     observable_result = _observable_tool_result(tool_name, result)
     logger.debug(f"[LLM] Tool result: {observable_result[:100]}")
 
@@ -645,6 +650,7 @@ async def _process_tool_call(
         "round_id": round_id,
         "round_tool_index": round_tool_index,
         "result": llm_view,
+        **({"tool_result": standard_result} if standard_result is not None else {}),
         "reasoning_content": full_reasoning_content,
         "assistant_content": assistant_content,
         "responses_snapshot": responses_snapshot,
@@ -668,6 +674,8 @@ async def _process_tool_call(
             if isinstance(persisted_done_rows, dict):
                 done_row_id = persisted_done_rows.get(str(done_evt.get("call_id") or ""))
 
+    if done_row_id is not None:
+        done_evt["_durable_message_id"] = str(done_row_id)
     done_record = _RoundDoneToolCall(
         event=done_evt,
         row_id=done_row_id,
@@ -683,6 +691,7 @@ async def _process_tool_call(
             role="tool",
             tool_call_id=tc["id"],
             content=tool_content,
+            tool_result=standard_result,
         )
     )
     return ""

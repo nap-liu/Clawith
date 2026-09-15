@@ -129,7 +129,9 @@ async def run_llm_and_stream_impl(
             )
 
         async def tool_call_to_ws(data: dict):
-            public_data = {k: v for k, v in data.items() if not k.startswith("_")}
+            from app.services.tool_result_display import tool_event_for_display
+
+            public_data = tool_event_for_display(data)
             if not await reserve_visible_output():
                 raise RuntimeError("Onboarding claim lost before tool output")
             if public_data.get("status") == "done":
@@ -147,7 +149,7 @@ async def run_llm_and_stream_impl(
                 )
             )
             if public_data.get("status") in {"running", "done"} and not data.get("_durable_persisted"):
-                await self._save_tool_call_to_db(public_data, turn_anchor_id=turn_anchor_id)
+                await self._save_tool_call_to_db(data, turn_anchor_id=turn_anchor_id)
 
         async def thinking_to_ws(text: str):
             if not await reserve_visible_output():

@@ -57,7 +57,7 @@ try {
         onPreviewImages: () => {},
     }));
     assert.match(h5FileCard, /<img[^>]*draggable="false"/);
-    assert.doesNotMatch(h5FileCard, /aria-label="下载文件"/);
+    assert.doesNotMatch(h5FileCard, /<a[^>]*download=/);
 
     const desktopFileCard = renderToStaticMarkup(React.createElement(ChatFileDeliveryCard, {
         agentId: '00000000-0000-0000-0000-000000000001',
@@ -65,7 +65,7 @@ try {
         mode: 'pc',
         onPreviewImages: () => {},
     }));
-    assert.match(desktopFileCard, /aria-label="下载文件"/);
+    assert.match(desktopFileCard, /<a[^>]*download="protected.png"/);
 
     const mediaDelivery = {
         id: 'media-delivery',

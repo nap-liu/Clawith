@@ -75,6 +75,17 @@ def message_references_media_path_impl(message: ChatMessage, path: str) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
+    standard_result = payload.get("tool_result")
+    if payload.get("status") == "done" and isinstance(standard_result, dict):
+        from app.services.tool_results import agent_resource_path
+
+        for block in standard_result.get("content", []):
+            resource = block.get("resource", block)
+            try:
+                if agent_resource_path(resource.get("uri", "")) == path:
+                    return True
+            except ValueError:
+                continue
     tool_name = str(payload.get("name") or payload.get("tool_name") or "")
     if tool_name not in {"send_channel_file", "send_media", "send_audio", "send_video"}:
         return False

@@ -3,6 +3,7 @@
 import uuid
 
 from loguru import logger
+from app.services.tool_results import normalize_tool_result
 from sqlalchemy import select
 
 from app.config import get_settings
@@ -27,7 +28,7 @@ async def _execute_mcp_tool(
     user_id=None,
     session_id: str = "",
     tool_call_id: str = "",
-) -> str:
+) -> str | dict:
     """Execute a tool via MCP if it exists in the DB as an MCP tool."""
     try:
         from app.models.mcp_server import MCPServer
@@ -224,7 +225,7 @@ async def _execute_mcp_tool(
 
 async def _execute_via_smithery_connect(
     mcp_url: str, tool_name: str, arguments: dict, config: dict, agent_id=None, server_id=None, tool_id=None
-) -> str:
+) -> str | dict:
     """Execute an MCP tool via Smithery Connect API.
 
     Uses stored namespace/connection or falls back to creating one.
@@ -293,7 +294,7 @@ async def _execute_via_smithery_connect(
                 try:
                     data = json_mod.loads(raw)
                 except json_mod.JSONDecodeError:
-                    return f"❌ Unexpected response from Smithery: {raw[:300]}"
+                    return normalize_tool_result(f"❌ Unexpected response from Smithery: {raw[:300]}", is_error=True)
 
             if "error" in data:
                 err = data["error"]
@@ -304,31 +305,12 @@ async def _execute_via_smithery_connect(
                     recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id, server_id, tool_id)
                     if recovery_result:
                         return recovery_result
-                return f"❌ MCP tool error: {msg[:300]}"
+                return normalize_tool_result(f"❌ MCP tool error: {msg[:300]}", is_error=True)
 
-            result = data.get("result", {})
-            if isinstance(result, str):
-                return result
-
-            content_blocks = result.get("content", []) if isinstance(result, dict) else []
-            texts = []
-            for block in content_blocks:
-                if isinstance(block, str):
-                    texts.append(block)
-                elif isinstance(block, dict):
-                    if block.get("type") == "text":
-                        texts.append(block.get("text", ""))
-                    elif block.get("type") == "image":
-                        texts.append(f"[Image: {block.get('mimeType', 'image')}]")
-                    else:
-                        texts.append(str(block))
-                else:
-                    texts.append(str(block))
-
-            return "\n".join(texts) if texts else str(result)
+            return normalize_tool_result(data.get("result", {}))
 
     except Exception as e:
-        return f"❌ Smithery Connect error: {str(e)[:200]}"
+        return normalize_tool_result(f"❌ Smithery Connect error: {str(e)[:200]}", is_error=True)
 
 
 async def _smithery_auto_recover(

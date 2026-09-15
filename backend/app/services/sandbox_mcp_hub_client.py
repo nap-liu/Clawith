@@ -17,9 +17,9 @@ Usage::
     tools  = await client.list_tools("yunxiao__abc123456789")
     result = await client.call_tool("yunxiao__abc123456789", "get_current_user", {})
 """
-import json
 
 import httpx
+from app.services.tool_results import normalize_tool_result
 
 
 class SandboxMcpHubClient:
@@ -87,12 +87,12 @@ class SandboxMcpHubClient:
         tool_name: str,
         arguments: dict,
         timeout: float = 120.0,
-    ) -> str:
+    ) -> dict:
         """Call *tool_name* on *server_name* via the hub.
 
-        Returns the concatenated text content on success.
+        Returns a standard CallToolResult with every content block intact.
         Never raises — all errors (network, HTTP, envelope) are returned as an
-        ``❌ …`` error string so the LLM sees the error message rather than a
+        standard error result so the LLM sees the error message rather than a
         Python exception.
         """
         try:
@@ -106,22 +106,18 @@ class SandboxMcpHubClient:
                 )
 
             if r.status_code != 200:
-                return f"❌ MCP tool error: HTTP {r.status_code}: {r.text[:200]}"
+                return normalize_tool_result(f"❌ MCP tool error: HTTP {r.status_code}: {r.text[:200]}", is_error=True)
 
             body = r.json()
         except httpx.HTTPError as e:
-            return f"❌ MCP tool network error: {e}"
+            return normalize_tool_result(f"❌ MCP tool network error: {e}", is_error=True)
         except Exception as e:
-            return f"❌ MCP tool error: {e}"
+            return normalize_tool_result(f"❌ MCP tool error: {e}", is_error=True)
 
         if not body.get("success"):
-            return f"❌ MCP tool error: {body.get('message')}"
+            return normalize_tool_result(f"❌ MCP tool error: {body.get('message')}", is_error=True)
 
-        data = body.get("data") or {}
-        blocks: list[dict] = data.get("content", []) if isinstance(data, dict) else []
-        texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
-
-        if texts:
-            return "\n".join(texts)
-        # Fallback: data as JSON string if no text blocks
-        return data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+        data = body.get("data") or {"content": []}
+        if isinstance(data, dict) and "content" not in data and "structuredContent" not in data:
+            data = {"content": [], "structuredContent": data}
+        return normalize_tool_result(data)

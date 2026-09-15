@@ -220,6 +220,7 @@ async def _assemble_api_messages_for_call_llm(
                 tool_calls=msg.get("tool_calls"),
                 tool_call_id=msg.get("tool_call_id"),
                 responses_snapshot=msg.get("responses_snapshot"),
+                tool_result=msg.get("tool_result"),
             )
         )
     assembled = _convert_messages_for_vision(assembled, supports_vision)
@@ -395,11 +396,16 @@ async def _call_llm_dispatch_round_with_context_recovery(
                 await state.on_tool_delta(data)
 
         try:
+            from app.services.llm.tool_result_projection import project_tool_results
+
+            provider_messages = await project_tool_results(
+                current_messages, model=state.model, agent_id=state.agent_id,
+            )
             response = await _stream_with_throttle_retry(
                 client,
                 model=state.model,
                 round_i=round_number,
-                messages=current_messages,
+                messages=provider_messages,
                 tools=state.tools_for_llm if state.tools_for_llm else None,
                 temperature=state.model.temperature,
                 reasoning_effort=getattr(state.model, "reasoning_effort", None),

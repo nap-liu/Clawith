@@ -108,6 +108,8 @@ class GeminiClient(LLMClient):
                     text = part.get("text", "")
                     if text:
                         parts.append({"text": text})
+                elif ptype == "inline_data":
+                    parts.append({"inlineData": {"mimeType": part["mime_type"], "data": part["data"]}})
                 elif ptype == "image_url":
                     image_obj = part.get("image_url", {})
                     image_url = image_obj.get("url", "") if isinstance(image_obj, dict) else ""
