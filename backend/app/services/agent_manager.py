@@ -125,6 +125,9 @@ class AgentManager:
                 if src.is_dir():
                     continue
                 rel = src.relative_to(template_dir).as_posix()
+                # Skill packages are installed from the configurable catalog.
+                if rel.startswith("skills/") and rel != "skills/.gitkeep":
+                    continue
                 if rel == "tasks.json" or rel == "todo.json" or rel.startswith("enterprise_info/"):
                     continue
                 tasks.append(

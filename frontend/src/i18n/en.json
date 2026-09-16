@@ -5670,5 +5670,39 @@
     "resetConfirm": "Clear",
     "saving": "Saving…",
     "saveError": "Could not save permissions. Refresh and try again."
+  },
+  "skillManagement": {
+    "upload": "Upload Skill",
+    "uploaded": "Skill uploaded. Edit and publish when ready.",
+    "uploadHint": "Upload a ZIP package or a single SKILL.md. Packages must contain SKILL.md and may include scripts and references. Uploads are saved as drafts.",
+    "chooseFile": "Choose file",
+    "folderHint": "Use letters, numbers, hyphens or underscores. Choose a unique folder name.",
+    "uploadScope": "Management scope",
+    "defaultInstall": "Install by default for new agents",
+    "updateProgress": "View update progress",
+    "title": "Skill management",
+    "updatedAt": "Updated",
+    "name": "Name",
+    "description": "Description",
+    "failed": "Operation failed",
+    "edit": "Edit",
+    "builtin": "Platform built-in",
+    "custom": "Custom",
+    "installs": "Active installations: {{count}}",
+    "setDefault": "Install by default for new agents",
+    "cancelDefault": "Remove default installation",
+    "hide": "Hide for this tenant",
+    "show": "Show for this tenant",
+    "copy": "Copy to this tenant",
+    "updateAll": "Update all installed agents",
+    "updateConfirm": "Update {{count}} installed copies and overwrite their local changes? Other workspace files are preserved. Copy a skill first to maintain it independently.",
+    "progress": "Total {{total}}: {{succeeded}} succeeded, {{failed}} failed, {{pending}} pending, {{skipped}} skipped",
+    "retry": "Retry failed or resume pending",
+    "empty": "No skills",
+    "status": {
+      "draft": "Draft",
+      "published": "Published",
+      "offline": "Offline"
+    }
   }
 }

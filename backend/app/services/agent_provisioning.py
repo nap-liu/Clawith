@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from sqlalchemy import and_, or_, select
 
 from app.models.agent import Agent
+from app.models.skill import SkillInstall
+from app.services.skill_policy import tenant_skill_visible
 from app.services.llm.failure_outcome import render_message
 from app.schemas.agent_permissions import AgentGrant
 from app.services.agent_permissions import update_agent_grants
@@ -76,6 +78,8 @@ async def validate_requested_skill_ids(db, *, tenant_id, skill_ids: list) -> set
         select(Skill.id).where(
             Skill.id.in_(requested),
             or_(*allowed_scope),
+            Skill.status != "offline",
+            tenant_skill_visible(tenant_id),
         )
     )
     allowed = set(rows.all())
@@ -241,14 +245,14 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
     from app.api.relationships import _regenerate_relationships_file
     await _regenerate_relationships_file(db, agent.id)
 
-    # Copy selected skills + mandatory default skills into agent workspace
+    # Copy selected skills and configured defaults into the Agent workspace.
     from app.models.skill import Skill
     from sqlalchemy.orm import selectinload
 
-    # Always include global default skills (mcp-installer, skill-creator,
-    # complex-task-executor)
+    # Defaults are administrator-owned catalog configuration.
     default_result = await db.execute(
-        select(Skill).where(Skill.is_default, Skill.tenant_id.is_(None))
+        select(Skill).where(Skill.is_default, Skill.tenant_id.is_(None),
+                            Skill.status == "published", tenant_skill_visible(tenant_id))
     )
     default_ids = {s.id for s in default_result.scalars().all()}
 
@@ -296,10 +300,15 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
             .where(
                 Skill.id.in_(all_skill_ids),
                 or_(Skill.tenant_id.is_(None), Skill.tenant_id == tenant_id),
+                Skill.status != "offline",
+                tenant_skill_visible(tenant_id),
             )
             .options(selectinload(Skill.files))
         )
         skills = skills_result.scalars().all()
+        for skill in skills:
+            db.add(SkillInstall(tenant_id=tenant_id, agent_id=agent.id, skill_id=skill.id,
+                                installed_version=skill.version, installed_by_user_id=creator.id))
 
         file_specs = [
             (f"{agent_prefix}/skills/{skill.folder_name}/{sf.path}", sf.content)

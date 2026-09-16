@@ -16,6 +16,7 @@ facts must be inspected rather than remembered.
 | Conversation, context, tools, sandbox, and environment boundaries | `.agents/architecture/` |
 | Identity, multi-SSO, SCIM directories, organization graphs, and channel bindings | `.agents/architecture/identity-directory-and-channel-bindings.md` |
 | Agent company/department/person grants, additive access, and migration | `.agents/architecture/agent-permissions.md` |
+| Skill management, configurable defaults, and publisher installation updates | `.agents/architecture/skills.md` |
 | Executable production release and rollback procedure | `.agents/runbooks/production_release.md` |
 
 The external-memory migration record is historical evidence, not an instruction

@@ -1,0 +1,2 @@
+.ui-file-upload-field { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.ui-file-upload-field > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); font-size: 12px; }

@@ -1,19 +1,15 @@
 """Seed default agents (Morty & Meeseeks) on first platform startup."""
 
 import uuid
-from datetime import datetime, timezone
 
 from loguru import logger
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
 
 from app.database import async_session
 from app.models.agent import Agent, AgentPermission
 from app.models.org import AgentAgentRelationship
-from app.models.skill import Skill, SkillFile
 from app.models.tool import Tool, AgentTool
 from app.models.trigger import AgentTrigger
 from app.models.user import User
@@ -21,6 +17,20 @@ from app.models.okr import OKRSettings
 from app.config import get_settings
 from app.services.agent_manager import agent_manager
 from app.services.storage import get_storage_backend, store_agent_bytes
+from app.services.skill_install_defaults import install_seed_agent_skills
+
+from app.services.agent_seeder_templates import (
+    MEESEEKS_SKILLS,
+    MEESEEKS_SOUL,
+    MORTY_SKILLS,
+    MORTY_SOUL,
+    OKR_AGENT_SOUL,
+)
+
+from app.services.agent_seeder_okr_helpers import (
+    _ensure_okr_tool_rows_exist,
+    _sync_okr_triggers_with_settings,
+)
 
 settings = get_settings()
 SEED_MARKER_KEY = "_bootstrap/.seeded"
@@ -43,13 +53,7 @@ async def _append_seed_marker(line: str) -> None:
     await storage.write_text(SEED_MARKER_KEY, updated, encoding="utf-8")
 
 
-from app.services.agent_seeder_templates import (
-    MEESEEKS_SKILLS,
-    MEESEEKS_SOUL,
-    MORTY_SKILLS,
-    MORTY_SOUL,
-    OKR_AGENT_SOUL,
-)
+
 
 
 async def seed_default_agents(tenant_id=None, creator_id=None, db=None):
@@ -166,32 +170,9 @@ async def seed_default_agents(tenant_id=None, creator_id=None, db=None):
                 content_type="text/markdown; charset=utf-8",
             )
 
-        # ── Assign skills ──
-        all_skills_result = await db.execute(
-            select(Skill).options(selectinload(Skill.files))
-        )
-        all_skills = {s.folder_name: s for s in all_skills_result.scalars().all()}
-
-        for agent, skill_folders in [(morty, MORTY_SKILLS), (meeseeks, MEESEEKS_SKILLS)]:
-            if agent.name not in created_names:
-                continue
-            # Always include default skills
-            folders_to_copy = set(skill_folders)
-            for fname, skill in all_skills.items():
-                if skill.is_default:
-                    folders_to_copy.add(fname)
-
-            for fname in folders_to_copy:
-                skill = all_skills.get(fname)
-                if not skill:
-                    continue
-                for sf in skill.files:
-                    await store_agent_bytes(
-                        agent.id,
-                        f"skills/{skill.folder_name}/{sf.path}",
-                        sf.content.encode("utf-8"),
-                        content_type="text/plain; charset=utf-8",
-                    )
+        for agent, folders in [(morty, MORTY_SKILLS), (meeseeks, MEESEEKS_SKILLS)]:
+            if agent.name in created_names:
+                await install_seed_agent_skills(db, agent, folders)
 
         # ── Assign all default tools ──
         default_tools_result = await db.execute(
@@ -565,10 +546,7 @@ async def _seed_okr_triggers(db, agent_id: uuid.UUID) -> None:
         logger.info(f"[AgentSeeder] Created system trigger '{t['name']}' for OKR Agent")
 
 
-from app.services.agent_seeder_okr_helpers import (
-    _ensure_okr_tool_rows_exist,
-    _sync_okr_triggers_with_settings,
-)
+
 
 
 async def patch_existing_okr_agent() -> None:

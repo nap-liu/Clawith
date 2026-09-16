@@ -18,6 +18,7 @@ from app.database import async_session
 from app.models.skill import Skill, SkillFile
 from app.core.security import get_current_admin, get_current_user, require_role
 from app.models.user import User
+from app.services.skill_policy import tenant_skill_visible
 from loguru import logger
 
 router = APIRouter(prefix="/skills", tags=["skills"])
@@ -280,6 +281,7 @@ async def list_skills(current_user: User = Depends(get_current_user)):
     tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
         query = select(Skill).where(_or(Skill.status == "draft", Skill.is_builtin.is_(True))).order_by(Skill.name)
+        query = query.where(Skill.status != "offline", tenant_skill_visible(current_user.tenant_id))
         # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific skills
         if tenant_id:
             query = query.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))

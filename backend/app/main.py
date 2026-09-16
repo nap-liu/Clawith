@@ -238,9 +238,8 @@ async def lifespan(fastapi_app: FastAPI):
             logger.warning(f"[startup] Agent templates seed failed: {e}")
 
         try:
-            from app.services.skill_seeder import seed_skills, push_default_skills_to_existing_agents
+            from app.services.skill_seeder import seed_skills
             await seed_skills()
-            await push_default_skills_to_existing_agents()
         except Exception as e:
             logger.warning(f"[startup] Skills seed failed: {e}")
 
@@ -430,6 +429,7 @@ from app.api.schedules import router as schedules_router
 from app.api.tools import router as tools_router
 from app.api.cli_tools import router as cli_tools_router
 from app.api.skills import router as skills_router
+from app.api.skill_management import router as skill_management_router
 from app.api.skill_market import agent_market_router, market_router as skill_market_router
 from app.api.users import router as users_router
 from app.api.chat_sessions import router as chat_sessions_router
@@ -496,6 +496,7 @@ app.include_router(tools_router, prefix=settings.API_PREFIX)
 app.include_router(files_upload_router, prefix=settings.API_PREFIX)
 app.include_router(enterprise_kb_router, prefix=settings.API_PREFIX)
 # Static market routes must be registered before /skills/{skill_id}.
+app.include_router(skill_management_router, prefix=settings.API_PREFIX)
 app.include_router(skill_market_router, prefix=settings.API_PREFIX)
 app.include_router(agent_market_router, prefix=settings.API_PREFIX)
 app.include_router(skills_router, prefix=settings.API_PREFIX)

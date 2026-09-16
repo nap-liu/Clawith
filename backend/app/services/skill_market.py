@@ -22,6 +22,7 @@ from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.user import User
 from app.services.storage import get_storage_backend, normalize_storage_key
 from app.services.workspace_locking import serialize_workspace_write
+from app.services.skill_policy import require_skill_manager, tenant_skill_visible
 
 _settings = get_settings()
 MAX_SKILL_SIZE = int(getattr(_settings, "MAX_SKILL_SIZE", 512_000) or 512_000)
@@ -35,6 +36,7 @@ _PRIVATE_KEY_MARKER = "-----BEGIN PRIVATE KEY-----"
 def _market_scope(tenant_id: uuid.UUID | None):
     return and_(
         Skill.status == "published",
+        tenant_skill_visible(tenant_id),
         or_(Skill.visibility == "public", Skill.tenant_id == tenant_id),
     )
 
@@ -177,7 +179,9 @@ async def publish_agent_skill(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the publisher or an admin can update this Skill")
         for existing_file in list(skill.files):
             await db.delete(existing_file)
-        skill.version = (skill.version or 1) + (1 if skill.status in {"published", "offline"} else 0)
+        # Frozen rollout snapshots require a new version for every replacement,
+        # including drafts that were previously published or installed.
+        skill.version = (skill.version or 1) + 1
     else:
         skill = Skill(
             tenant_id=agent.tenant_id,
@@ -251,7 +255,7 @@ async def list_market_skills(
             Skill.updated_at.desc(),
         )
     else:
-        stmt = stmt.order_by(downloads.desc(), Skill.updated_at.desc())
+        stmt = stmt.order_by(Skill.updated_at.desc(), Skill.id)
 
     rows = (await db.execute(stmt.limit(max(1, min(limit, 100))))).all()
     return [
@@ -284,6 +288,7 @@ def serialize_market_skill(
         "version": skill.version,
         "downloads": int(downloads or 0),
         "is_builtin": skill.is_builtin,
+        "is_default": skill.is_default,
         "publisher_name": publisher_name or ("Platform" if skill.is_builtin else "Unknown"),
         "publisher_user_id": str(skill.publisher_user_id) if skill.publisher_user_id else None,
         "publisher_agent_id": str(skill.publisher_agent_id) if skill.publisher_agent_id else None,
@@ -554,10 +559,7 @@ async def take_skill_offline(db: AsyncSession, *, skill_id: uuid.UUID, actor: Us
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Skill not found")
     await lock_skill_folder(db, skill.folder_name)
     await db.refresh(skill, attribute_names=["status", "folder_name", "tenant_id", "publisher_user_id"])
-    if actor.role != "platform_admin" and skill.tenant_id != actor.tenant_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Skill not found")
-    if actor.role not in {"platform_admin", "org_admin"} and skill.publisher_user_id != actor.id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the publisher or an admin can take this Skill offline")
+    require_skill_manager(skill, actor)
     skill.status = "offline"
     await db.flush()
     # PostgreSQL updates ``updated_at`` server-side. Refresh before returning
@@ -567,51 +569,19 @@ async def take_skill_offline(db: AsyncSession, *, skill_id: uuid.UUID, actor: Us
 
 
 async def relist_market_skill(db: AsyncSession, *, skill_id: uuid.UUID, actor: User) -> Skill:
-    """Refresh an offline market copy from its source Agent and publish it again."""
+    """Relist the catalog contents; no source Agent is required."""
     skill = await db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Skill not found")
     await lock_skill_folder(db, skill.folder_name)
-    await db.refresh(
-        skill,
-        attribute_names=[
-            "status",
-            "folder_name",
-            "tenant_id",
-            "publisher_user_id",
-            "publisher_agent_id",
-            "is_builtin",
-            "name",
-            "description",
-            "category",
-            "visibility",
-        ],
-    )
-    if skill.is_builtin:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Builtin Skills cannot be relisted here")
-    if actor.role != "platform_admin" and skill.tenant_id != actor.tenant_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Skill not found")
-    if actor.role not in {"platform_admin", "org_admin"} and skill.publisher_user_id != actor.id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the publisher or an admin can relist this Skill")
+    await db.refresh(skill)
+    require_skill_manager(skill, actor)
     if skill.status != "offline":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only an offline Skill can be relisted")
-    if not skill.publisher_agent_id:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This Skill has no source Agent to relist from")
-
-    source_agent = await db.get(Agent, skill.publisher_agent_id)
-    if not source_agent or source_agent.tenant_id != skill.tenant_id:
-        raise HTTPException(status.HTTP_409_CONFLICT, "The source Agent is no longer available")
-
-    return await publish_agent_skill(
-        db,
-        agent=source_agent,
-        actor=actor,
-        path=f"skills/{skill.folder_name}",
-        name=skill.name,
-        description=skill.description,
-        category=skill.category,
-        visibility=skill.visibility,
-    )
+    skill.status = "published"
+    await db.flush()
+    await db.refresh(skill)
+    return skill
 
 
 async def delete_offline_market_skill(
@@ -635,16 +605,14 @@ async def delete_offline_market_skill(
             "is_builtin",
         ],
     )
-    if skill.is_builtin:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Builtin Skills cannot be deleted from the market")
-    if actor.role != "platform_admin" and skill.tenant_id != actor.tenant_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Skill not found")
-    if actor.role not in {"platform_admin", "org_admin"} and skill.publisher_user_id != actor.id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the publisher or an admin can delete this Skill")
+    require_skill_manager(skill, actor)
     if skill.status != "offline":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only an offline Skill can be deleted")
 
     deleted_id = str(skill.id)
+    if skill.is_builtin:
+        from app.services.skill_management import record_builtin_import
+        await record_builtin_import(db, skill.folder_name)
     await db.delete(skill)
     await db.flush()
     return {"status": "ok", "skill_id": deleted_id}

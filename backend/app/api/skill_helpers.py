@@ -1,6 +1,5 @@
 """Shared external-registry and persistence helpers for the Skills API."""
 
-import asyncio
 import base64
 import io
 import os
@@ -10,13 +9,12 @@ from pathlib import Path
 
 import httpx
 from fastapi import HTTPException
-from loguru import logger
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
 from app.database import async_session
 from app.models.skill import Skill, SkillFile
 from app.models.user import User
+from app.services.skill_policy import require_skill_manager
 
 CLAWHUB_BASE = os.getenv("CLAWHUB_BASE", "https://clawhub.ai/api").rstrip("/")
 CLAWHUB_MIRROR_BASE = os.getenv("CLAWHUB_MIRROR_BASE", "https://cn.clawhub-mirror.com/api").rstrip("/")
@@ -302,6 +300,7 @@ def _ensure_skill_write_access(skill: Skill, current_user: User):
     """Protect market-managed Skills; retain legacy draft CRUD permissions."""
     if getattr(skill, "status", "draft") != "draft":
         raise HTTPException(409, "Published market Skills must be managed through the Skill market")
+    require_skill_manager(skill, current_user)
     if current_user.role == "platform_admin":
         return
     if not current_user.tenant_id:

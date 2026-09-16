@@ -133,7 +133,7 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
     )
     assert "already been executed" in replay
 
-    # Relisting refreshes the market snapshot from the unchanged source folder.
+    # Relisting preserves the independently managed catalog contents.
     await _write_skill(agent.id, folder, "Withdrawal behavior v2")
     async with async_session() as db:
         republished = await relist_market_skill(
@@ -142,7 +142,7 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
             actor=await db.get(User, owner.id),
         )
         assert republished.status == "published"
-        assert republished.version == 2
+        assert republished.version == 1
         assert serialize_market_skill(republished)["updated_at"] is not None
         await db.commit()
 
@@ -152,7 +152,8 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
             skill_id=skill_id,
             tenant_id=tenant.id,
         )
-        assert "Withdrawal behavior v2" in refreshed_detail["skill_md"]
+        assert "Withdrawal behavior v2" not in refreshed_detail["skill_md"]
+        assert "Withdrawal behavior" in refreshed_detail["skill_md"]
         intruder = Agent(
             tenant_id=tenant.id,
             creator_id=owner.id,

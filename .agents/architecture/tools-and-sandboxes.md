@@ -421,3 +421,10 @@ list pagination returns whole records. Large tool outputs continue through the
 shared full-result storage and bounded model-facing view. Message-trigger
 matching retains the complete source message rather than a character slice.
 Seeded and fallback definitions come from `trigger_tool_contract.py`.
+
+## Skill catalog
+
+Skill definitions, tenant hiding, configurable default installation, and explicit
+publisher rollouts follow [Skill management](skills.md). The market and enterprise
+settings share the same management surface. Bundled origin does not bypass the
+catalog lifecycle or restore administrator changes at startup.

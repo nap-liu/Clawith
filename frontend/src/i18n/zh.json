@@ -5736,5 +5736,39 @@
     "resetConfirm": "清除",
     "saving": "保存中…",
     "saveError": "权限保存失败，请刷新后重试。"
+  },
+  "skillManagement": {
+    "upload": "上传 Skill",
+    "uploaded": "Skill 已上传，可编辑后上架",
+    "uploadHint": "支持 ZIP 技能包或单个 SKILL.md。技能包须包含 SKILL.md，可附带脚本和参考文件。上传后保存为草稿。",
+    "chooseFile": "选择文件",
+    "folderHint": "目录名使用字母、数字、连字符或下划线，不可与现有技能重复。",
+    "uploadScope": "管理范围",
+    "defaultInstall": "新数字员工默认安装",
+    "updateProgress": "查看更新进度",
+    "title": "技能管理",
+    "updatedAt": "更新时间",
+    "name": "名称",
+    "description": "描述",
+    "failed": "操作失败",
+    "edit": "编辑",
+    "builtin": "平台内置",
+    "custom": "自定义",
+    "installs": "有效安装：{{count}}",
+    "setDefault": "设为新数字员工默认安装",
+    "cancelDefault": "取消默认安装",
+    "hide": "本租户隐藏",
+    "show": "本租户显示",
+    "copy": "复制到本租户",
+    "updateAll": "更新所有已安装数字员工",
+    "updateConfirm": "将更新 {{count}} 个已安装副本并覆盖其中的本地修改，其他工作区文件不受影响。需要独立维护的技能请先复制。是否继续？",
+    "progress": "共 {{total}} 个：成功 {{succeeded}}，失败 {{failed}}，待处理 {{pending}}，跳过 {{skipped}}",
+    "retry": "重试失败或继续未完成项",
+    "empty": "暂无技能",
+    "status": {
+      "draft": "草稿",
+      "published": "已上架",
+      "offline": "已下架"
+    }
   }
 }

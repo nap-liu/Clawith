@@ -1,6 +1,20 @@
-import { request } from "./core";
+import { request, uploadFile } from "./core";
 
 export const skillApi = {
+  manage: {
+    upload: (file: File, folder: string, scope: string) => uploadFile('/skills/manage/upload', file, { folder, scope }),
+    list: () => request<MarketSkill[]>('/skills/manage'),
+    detail: (id: string) => request<MarketSkill>(`/skills/manage/${id}`),
+    update: (id: string, data: Partial<MarketSkill> & { expected_version?: number }) =>
+      request<MarketSkill>(`/skills/manage/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    hide: (id: string, hidden: boolean) => request<MarketSkill>(`/skills/manage/${id}/hidden`, {
+      method: 'PUT', body: JSON.stringify({ hidden }),
+    }),
+    copy: (id: string) => request<MarketSkill>(`/skills/manage/${id}/copy`, { method: 'POST' }),
+    updateAll: (id: string) => request<SkillUpdateJob>(`/skills/manage/${id}/updates`, { method: 'POST' }),
+    progress: (id: string) => request<SkillUpdateJob>(`/skills/manage/updates/${id}`),
+    retry: (id: string) => request<SkillUpdateJob>(`/skills/manage/updates/${id}/retry`, { method: 'POST' }),
+  },
   list: () => request<any[]>("/skills/"),
   get: (id: string) => request<any>(`/skills/${id}`),
   create: (data: any) =>
@@ -127,12 +141,22 @@ export type MarketSkill = {
   version: number;
   downloads: number;
   is_builtin: boolean;
+  is_default?: boolean;
+  hidden?: boolean;
+  active_installs?: number;
+  latest_update_id?: string | null;
+  capabilities?: { edit: boolean; default: boolean; hide: boolean; copy: boolean; update_installs: boolean };
   publisher_name: string;
   publisher_user_id?: string | null;
   publisher_agent_id?: string | null;
   updated_at?: string | null;
   skill_md?: string;
   files?: Array<{ path: string; content: string }>;
+};
+
+export type SkillUpdateJob = {
+  id: string; version: number; total: number; succeeded: number;
+  failed: number; pending: number; skipped: number;
 };
 
 export type PublishMarketSkillInput = {

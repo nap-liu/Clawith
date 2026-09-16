@@ -1,7 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import FileBrowser from '../../../components/FileBrowser';
-import type { FileBrowserApi } from '../../../components/FileBrowser';
+import SkillManagement from '../../skill-management';
 import { skillApi } from '../../../services/api';
 
 export default function SkillsTab() {
@@ -31,12 +30,6 @@ export default function SkillsTab() {
         setTimeout(() => setToast(null), 4000);
     };
 
-    const adapter: FileBrowserApi = useMemo(() => ({
-        list: (path: string) => skillApi.browse.list(path),
-        read: (path: string) => skillApi.browse.read(path),
-        write: (path: string, content: string) => skillApi.browse.write(path, content),
-        delete: (path: string) => skillApi.browse.delete(path),
-    }), []);
 
     const handleSearch = async () => {
         if (!searchQuery.trim()) return;
@@ -314,13 +307,7 @@ export default function SkillsTab() {
                 </div>
             )}
 
-            <FileBrowser
-                key={refreshKey}
-                api={adapter}
-                features={{ newFile: true, newFolder: true, edit: true, delete: true, directoryNavigation: true }}
-                title={t('agent.skills.skillFiles', 'Skill Files')}
-                onRefresh={() => setRefreshKey(k => k + 1)}
-            />
+            <SkillManagement key={refreshKey} />
 
             {toast && (
                 <div style={{

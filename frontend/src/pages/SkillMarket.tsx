@@ -28,8 +28,9 @@ import { agentApi, fileApi, skillApi, type MarketSkill, type PublishMarketSkillI
 import { useAuthStore } from '../stores';
 import type { Agent } from '../types';
 import './SkillMarket.css';
+import SkillManagement, { SkillUpdatedAt } from './skill-management';
 
-type MarketTab = 'discover' | 'mine';
+type MarketTab = 'discover' | 'mine' | 'manage';
 type MarketSkillFile = NonNullable<MarketSkill['files']>[number];
 
 type SkillTreeNode = {
@@ -175,6 +176,7 @@ function SkillPreviewDrawer({
                             <span>{displayedDetail?.is_builtin ? t('skillMarket.platformPublisher') : displayedDetail?.publisher_name || '—'}</span>
                             <span>{displayedDetail?.version ? t('skillMarket.version', { version: displayedDetail.version }) : '—'}</span>
                             <span>{t('skillMarket.installCount', { count: displayedDetail?.downloads || 0 })}</span>
+                            <SkillUpdatedAt value={displayedDetail?.updated_at} />
                         </div>
                     </div>
                     <Button type="button" variant="ghost" onClick={onClose} aria-label={t('common.close')}>
@@ -258,6 +260,7 @@ function SkillCard({
                 </div>
             </div>
             <p>{skill.description || t('skillMarket.noDescription')}</p>
+            <SkillUpdatedAt value={skill.updated_at} />
             <div className="skill-market-card-meta">
                 <span>{skill.visibility === 'public' ? <IconWorld size={13} /> : <IconBuilding size={13} />}
                     {skill.visibility === 'public' ? t('skillMarket.public') : t('skillMarket.company')}
@@ -533,6 +536,9 @@ export default function SkillMarket() {
                     <Button type="button" variant={tab === 'mine' ? 'secondary' : 'ghost'} onClick={() => setTab('mine')}>
                         {t('skillMarket.tabs.mine')}
                     </Button>
+                    <Button type="button" variant={tab === 'manage' ? 'secondary' : 'ghost'} onClick={() => setTab('manage')}>
+                        {t('skillManagement.title')}
+                    </Button>
                 </div>
                 {tab === 'discover' && (
                     <form className="skill-market-search" onSubmit={submitSearch}>
@@ -543,17 +549,45 @@ export default function SkillMarket() {
                 )}
             </div>
 
-            {showPublish && (
-                <section className="skill-market-workbench" aria-live="polite">
-                    <div className="skill-market-workbench-head">
-                        <div>
-                            <span>{t('skillMarket.publish')}</span>
-                            <h2>{t('skillMarket.publishFromAgent')}</h2>
+
+
+            {tab === 'manage' ? <SkillManagement /> : loading ? (
+                <div className="skill-market-empty">{t('common.loading')}</div>
+            ) : skills.length ? (
+                <section className="skill-market-grid">
+                    {skills.map((skill) => (
+                        <SkillCard
+                            key={skill.id}
+                            skill={skill}
+                            mine={tab === 'mine'}
+                            busy={busyKey.endsWith(skill.id)}
+                            onDetail={() => openDetail(skill.id)}
+                            onInstall={() => openInstall(skill)}
+                            onOffline={() => takeOffline(skill)}
+                            onRelist={() => relist(skill)}
+                            onDelete={() => deleteOffline(skill)}
+                        />
+                    ))}
+                </section>
+            ) : (
+                <div className="skill-market-empty">
+                    <IconPackage size={28} stroke={1.3} />
+                    <strong>{tab === 'mine' ? t('skillMarket.emptyMineTitle') : t('skillMarket.emptyMarketTitle')}</strong>
+                    <span>{tab === 'mine' ? t('skillMarket.emptyMineHint') : t('skillMarket.emptyMarketHint')}</span>
+                </div>
+            )}
+        </main>
+                <Drawer open={showPublish} onClose={() => { if (busyKey !== 'publish') closeWorkbench(); }} className="skill-form-drawer" ariaLabelledBy="skill-publish-title" closeOnEscape={busyKey !== 'publish'} closeOnBackdrop={busyKey !== 'publish'}>
+                    <div className="skill-preview-header">
+                        <div className="skill-preview-heading">
+                            <span className="skill-preview-kicker">{t('skillMarket.publish')}</span>
+                            <h2 id="skill-publish-title">{t('skillMarket.publishFromAgent')}</h2>
                         </div>
-                        <Button type="button" variant="ghost" onClick={closeWorkbench} aria-label={t('common.close')}><IconX size={17} /></Button>
+                        <Button type="button" variant="ghost" onClick={closeWorkbench} disabled={busyKey === 'publish'} aria-label={t('common.close')}><IconX size={17} /></Button>
                     </div>
 
-                    <form className="skill-market-form-body skill-market-publish-form" onSubmit={publish}>
+                    <form className="skill-drawer-form" onSubmit={publish}>
+                        <div className="skill-market-form-body skill-market-publish-form">
                             <label>{t('skillMarket.sourceAgent')}
                                 {publishAgentId && <SelectDropdown value={publishAgentId} options={agentOptions} onChange={setPublishAgentId} ariaLabel={t('skillMarket.sourceAgent')} />}
                             </label>
@@ -585,42 +619,15 @@ export default function SkillMarket() {
                                 </label>
                             </div>
                             <p className="skill-market-form-note">{t('skillMarket.publishNote')}</p>
-                            <div className="skill-market-form-actions">
-                                <Button variant="secondary" type="button" onClick={closeWorkbench}>{t('common.cancel')}</Button>
+                            </div>
+                            <footer className="skill-market-install-actions">
+                                <Button variant="secondary" type="button" onClick={closeWorkbench} disabled={busyKey === 'publish'}>{t('common.cancel')}</Button>
                                 <Button variant="primary" type="submit" disabled={!publishFolder || !publishName.trim() || busyKey === 'publish'}>
                                     <IconUpload size={14} />{busyKey === 'publish' ? t('skillMarket.publishing') : t('skillMarket.publish')}
                                 </Button>
-                            </div>
+                            </footer>
                     </form>
-                </section>
-            )}
-
-            {loading ? (
-                <div className="skill-market-empty">{t('common.loading')}</div>
-            ) : skills.length ? (
-                <section className="skill-market-grid">
-                    {skills.map((skill) => (
-                        <SkillCard
-                            key={skill.id}
-                            skill={skill}
-                            mine={tab === 'mine'}
-                            busy={busyKey.endsWith(skill.id)}
-                            onDetail={() => openDetail(skill.id)}
-                            onInstall={() => openInstall(skill)}
-                            onOffline={() => takeOffline(skill)}
-                            onRelist={() => relist(skill)}
-                            onDelete={() => deleteOffline(skill)}
-                        />
-                    ))}
-                </section>
-            ) : (
-                <div className="skill-market-empty">
-                    <IconPackage size={28} stroke={1.3} />
-                    <strong>{tab === 'mine' ? t('skillMarket.emptyMineTitle') : t('skillMarket.emptyMarketTitle')}</strong>
-                    <span>{tab === 'mine' ? t('skillMarket.emptyMineHint') : t('skillMarket.emptyMarketHint')}</span>
-                </div>
-            )}
-        </main>
+                </Drawer>
         {installSkill && (
             <Modal
                 open={installModalOpen}

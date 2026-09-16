@@ -29,6 +29,7 @@ facts from the current repository and authorized local Docker environment.
 | model selection, imagination, reasoning effort, provider generation parameters | `.agents/architecture/model-reasoning-controls.md` | — |
 | published pages, page management, page authorization filters or search | `.agents/architecture/published-page-management.md` | — |
 | builtin tools, MCP, CLI uploads, sandbox execution, enablement | `.agents/architecture/tools-and-sandboxes.md` | — |
+| Skill catalog, default installation, publishing, bulk installation updates | `.agents/architecture/skills.md` | — |
 | Docker, tests, local stack, browser E2E | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md` |
 | implementation or multi-file engineering change | all documents selected for its surfaces | `.agents/workflows/engineering_change.md` |
 | production configuration or deployment | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md`, `.agents/rules/release.md`, then `.agents/runbooks/production_release.md` in full |
