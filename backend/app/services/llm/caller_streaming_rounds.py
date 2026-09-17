@@ -78,6 +78,8 @@ async def _call_llm_resume_truncated_response(
                 content=RESUME_PROMPT,
             )
         )
+        if not partial_persisted:
+            state.recovery_overlay_messages.extend(state.api_messages[-2:])
         logger.info(
             f"[LLM] max_output_tokens hit; resume attempt "
             f"{state.max_output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERY_LIMIT} "
@@ -119,6 +121,7 @@ async def _call_llm_resume_truncated_response(
             resume_budget,
             round_i + 1,
         )
+        state.recovery_overlay_messages.clear()
         await _call_llm_track_response_usage(state, response, round_i + 1)
 
     if _response_was_truncated_by_length(response):
@@ -314,7 +317,9 @@ async def _call_llm_execute_tool_round(
                 details={"round": round_i + 1},
             )
         state.invalid_tool_call_retries += 1
-        state.api_messages.append(LLMMessage(role="user", content=retry_instruction))
+        retry_message = LLMMessage(role="user", content=retry_instruction)
+        state.api_messages.append(retry_message)
+        state.recovery_overlay_messages.append(retry_message)
         return None
     state.invalid_tool_call_retries = 0
 
@@ -358,22 +363,20 @@ async def _call_llm_execute_tool_round(
             _conf_reason = conf_call.error or "request_confirmation 参数无效"
         else:
             _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
-        state.api_messages.append(
-            LLMMessage(
+        invalid_assistant = LLMMessage(
                 role="assistant",
                 content=response.content or None,
                 tool_calls=sanitized_tool_calls,
                 reasoning_content=response.reasoning_content,
                 responses_snapshot=getattr(response, "responses_snapshot", None),
             )
-        )
-        state.api_messages.append(
-            LLMMessage(
+        invalid_tool = LLMMessage(
                 role="tool",
                 content=f"❌ {_conf_reason}",
                 tool_call_id=conf_call.call_id,
             )
-        )
+        state.api_messages.extend([invalid_assistant, invalid_tool])
+        state.recovery_overlay_messages.extend([invalid_assistant, invalid_tool])
         return None
 
     repeat_period = _repeating_tool_period(state.tool_round_history, sanitized_tool_calls)
@@ -544,7 +547,9 @@ async def _call_llm_execute_tool_round(
     if observation:
         state.tool_round_history = [*state.tool_round_history, observation][-6:]
     if _repeating_tool_period(state.tool_round_history) is not None:
-        state.api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
+        nudge = LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT)
+        state.api_messages.append(nudge)
+        state.recovery_overlay_messages.append(nudge)
 
     return None
 

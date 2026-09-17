@@ -103,7 +103,7 @@ async def list_enabled_tenant_models(
     """Return the saved, enabled model catalog visible to one tenant."""
     result = await db.execute(
         select(LLMModel).where(
-            LLMModel.tenant_id == tenant_id,
+            or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None)),
             LLMModel.enabled.is_(True),
             purpose_clause(),
         )
@@ -200,7 +200,16 @@ async def resolve_runtime_models(
         if model_id is None:
             return None
         model = (await db.execute(select(LLMModel).where(LLMModel.id == model_id))).scalar_one_or_none()
-        return model if model is not None and model.enabled and supports_purpose(model) else None
+        tenant_id = getattr(agent, "tenant_id", None)
+        return (
+            model
+            if model is not None
+            and tenant_id is not None
+            and model.tenant_id in {tenant_id, None}
+            and model.enabled
+            and supports_purpose(model)
+            else None
+        )
 
     primary_orm = await _load_enabled(agent.primary_model_id)
     fallback_orm = await _load_enabled(agent.fallback_model_id)

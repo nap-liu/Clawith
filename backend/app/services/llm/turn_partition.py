@@ -16,6 +16,7 @@ from app.services.message_context_order import context_message_time, order_messa
 
 
 MIN_PROTECTED_RECENT_TURNS = 3
+MIN_PROTECTED_CURRENT_ROUNDS = 3
 TERMINAL_TURN_STATUSES = {"completed", "failed", "cancelled"}
 TERMINAL_TOOL_STATUSES = {"done", "failed", "cancelled", "error"}
 OPEN_TOOL_STATUSES = {"pending", "running"}
@@ -289,6 +290,87 @@ def partition_turns(
     protected = tuple(historical[protected_start:])
 
     return TurnPartition(compactable=compactable, protected=protected, current=current)
+
+
+def current_turn_compactable_rows(
+    turn: ConversationTurn | None,
+    *,
+    keep_recent_rounds: int = MIN_PROTECTED_CURRENT_ROUNDS,
+) -> list[Any]:
+    """Return a closed prefix inside a long-running current tool turn.
+
+    The durable user anchor stays active. Completed provider/tool rounds before
+    the protected tail may be summarized, while an open or malformed tool row
+    and everything after it remain byte-for-byte replayable.
+    """
+    if turn is None or not turn.current or turn.user_row is None:
+        return []
+
+    rows = list(turn.rows[1:])
+    closed_boundaries: list[int] = []
+    seen_rounds: set[str] = set()
+    active_round = ""
+    call_states: dict[str, str] = {}
+
+    def round_closed() -> bool:
+        return bool(call_states) and all(
+            status in TERMINAL_TOOL_STATUSES for status in call_states.values()
+        )
+
+    def finish_round(boundary: int) -> bool:
+        if not round_closed():
+            return False
+        closed_boundaries.append(boundary)
+        return True
+
+    last_tool_index = -1
+    for index, row in enumerate(rows):
+        if _role(row) != "tool_call":
+            if active_round:
+                finish_round(last_tool_index)
+            break
+        if str(_meta(row).get("turn_anchor_id") or "") != _row_id(turn.user_row):
+            if active_round:
+                finish_round(last_tool_index)
+            break
+        try:
+            payload = json.loads(getattr(row, "content", "") or "{}")
+        except (TypeError, ValueError):
+            if active_round:
+                finish_round(last_tool_index)
+            break
+        if not isinstance(payload, dict):
+            if active_round:
+                finish_round(last_tool_index)
+            break
+        status = str(payload.get("status") or "")
+        if status not in OPEN_TOOL_STATUSES | TERMINAL_TOOL_STATUSES:
+            if active_round:
+                finish_round(last_tool_index)
+            break
+        round_id = str(payload.get("round_id") or "")
+        call_id = str(payload.get("call_id") or "")
+        round_key = round_id or (f"call:{call_id}" if call_id else f"row:{_row_id(row)}")
+        if active_round and round_key != active_round:
+            if not finish_round(last_tool_index):
+                break
+            seen_rounds.add(active_round)
+            if round_key in seen_rounds:
+                break
+            call_states = {}
+        active_round = round_key
+        state_key = call_id or f"row:{_row_id(row)}"
+        call_states[state_key] = status
+        last_tool_index = index
+    else:
+        if active_round:
+            finish_round(last_tool_index)
+
+    protected = max(0, int(keep_recent_rounds or 0))
+    compactable_count = len(closed_boundaries) - protected
+    if compactable_count <= 0:
+        return []
+    return rows[: closed_boundaries[compactable_count - 1] + 1]
 
 
 def protected_recent_rows(

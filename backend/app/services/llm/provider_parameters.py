@@ -1,7 +1,8 @@
 """Narrow endpoint-specific differences in otherwise standard chat requests."""
 
-from typing import Any
 from collections.abc import Mapping
+from copy import deepcopy
+from typing import Any
 
 import httpx
 
@@ -42,6 +43,68 @@ def supports_default_tool_choice(*, model: str | None, base_url: str | None) -> 
         is_bailian_endpoint(base_url)
         and str(model or "").lower() == "stepfun/step-3.7-flash"
     )
+
+
+def normalize_chat_tools(
+    tools: list[dict[str, Any]], *, model: str | None, base_url: str | None,
+) -> list[dict[str, Any]]:
+    """Project canonical tools into Bailian Kimi's JSON Schema dialect.
+
+    Moonshot's Bailian adapter rejects a parent ``type`` beside ``anyOf`` or
+    ``oneOf`` and requires that type on every union branch instead. Keep the
+    database schema canonical and apply the lossless rewrite only at the final
+    provider boundary.
+    """
+    model_name = str(model or "").lower()
+    is_kimi = model_name == "kimi-k3" or model_name.startswith("kimi/")
+    if not (is_bailian_endpoint(base_url) and is_kimi):
+        return tools
+
+    projected = deepcopy(tools)
+    for tool in projected:
+        function = tool.get("function")
+        if isinstance(function, dict):
+            parameters = function.get("parameters")
+            if isinstance(parameters, dict):
+                _move_union_parent_types(parameters)
+    return projected
+
+
+def _move_union_parent_types(schema: dict[str, Any]) -> None:
+    parent_type = schema.get("type")
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if parent_type is not None and isinstance(branches, list):
+            schema.pop("type", None)
+            for branch in branches:
+                if isinstance(branch, dict):
+                    branch.setdefault("type", parent_type)
+
+    mapping_keywords = (
+        "properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+    )
+    for keyword in mapping_keywords:
+        children = schema.get(keyword)
+        if isinstance(children, dict):
+            for child in children.values():
+                if isinstance(child, dict):
+                    _move_union_parent_types(child)
+
+    schema_keywords = (
+        "items", "additionalProperties", "contains", "not", "if", "then", "else",
+        "propertyNames", "unevaluatedProperties",
+    )
+    for keyword in schema_keywords:
+        child = schema.get(keyword)
+        if isinstance(child, dict):
+            _move_union_parent_types(child)
+
+    for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        children = schema.get(keyword)
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    _move_union_parent_types(child)
 
 
 def validate_chat_parameters(payload: dict[str, Any], *, base_url: str | None) -> None:

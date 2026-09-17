@@ -573,57 +573,16 @@ async def _send_message_to_agent(
                 messages[-1] = {"role": "user", "content": turn_text}
             else:
                 messages.append({"role": "user", "content": turn_text})
-            from app.services.llm.turn_partition import effective_keep_recent_turns
-            protected_keep_recent_turns = effective_keep_recent_turns(
-                target_model,
-                target_fallback,
+            from app.services.llm.context_recovery import build_context_recovery
+
+            _a2a_context_recovery = build_context_recovery(
+                agent_id=session_agent_id,
+                conversation_id=session_id,
+                turn_anchor_id=outbound_a2a_message.id,
+                ctx_size=ctx_size,
+                primary_model=target_model,
+                fallback_model=target_fallback,
             )
-            async def _a2a_context_recovery(_recovery_model, dispatch_budget):
-                from app.services.chat_history import load_recoverable_history_for_turn
-                from app.services.llm.compactor import (
-                    COMPACTION_NOT_APPLICABLE_REASONS,
-                    ContextRecoveryMessages,
-                    maybe_compact,
-                )
-                compacted = await maybe_compact(
-                    agent_id=session_agent_id,
-                    conversation_id=session_id,
-                    model=_recovery_model,
-                    last_prompt_tokens=getattr(dispatch_budget, "authoritative_prompt_tokens", None),
-                    current_anchor_id=outbound_a2a_message.id,
-                    force_required=getattr(dispatch_budget, "provider_overflow", False),
-                    keep_recent_turns_override=(
-                        getattr(dispatch_budget, "keep_recent_turns_override", None)
-                        if getattr(dispatch_budget, "provider_overflow", False)
-                        else protected_keep_recent_turns
-                    ),
-                )
-                preflight_not_applicable = (
-                    not compacted.triggered
-                    and compacted.skipped_reason
-                    in COMPACTION_NOT_APPLICABLE_REASONS
-                    and dispatch_budget.fits
-                )
-                if not compacted.triggered and not preflight_not_applicable:
-                    logger.warning(
-                        f"[A2A] context recovery could not compact session={session_id}: {compacted.skipped_reason}"
-                    )
-                    return None
-                async with async_session() as recovery_db:
-                    recovered = await load_recoverable_history_for_turn(
-                        recovery_db,
-                        agent_id=session_agent_id,
-                        conversation_id=session_id,
-                        turn_anchor_id=outbound_a2a_message.id,
-                        ctx_size=ctx_size,
-                    )
-                if not recovered:
-                    logger.warning(f"[A2A] context recovery lost latest-anchor race session={session_id}")
-                    return None
-                return ContextRecoveryMessages(
-                    recovered,
-                    preflight_not_applicable=preflight_not_applicable,
-                )
             async def _a2a_persist(evt: dict):
                 await persist_tool_call(
                     async_session,

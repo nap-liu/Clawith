@@ -188,6 +188,98 @@ async def test_large_tool_heavy_history_replay_compacts_and_keeps_three_raw_turn
         await _cleanup(conv_id)
 
 
+async def test_oversized_current_turn_uses_lossless_fallback_without_protection(
+    monkeypatch,
+    tmp_path,
+):
+    """Trigger/A2A loops recover even when summary I/O fails on their only turn."""
+    import httpx
+    import json as _json
+    from sqlalchemy import select as _select
+    from unittest.mock import AsyncMock
+
+    import app.services.llm.compactor as compactor
+    from app.models.chat_compaction import ChatCompaction
+    from tests.compactor_futility_support import _configure_local_storage
+
+    rows_spec = [("user", "持续执行当前自动化任务", 100)]
+    for index in range(6):
+        for status in ("running", "done"):
+            rows_spec.append((
+                "tool_call",
+                _json.dumps({
+                    "name": "read_file",
+                    "args": {"path": f"workspace/{index}.md"},
+                    "status": status,
+                    "result": f"result-{index}" if status == "done" else None,
+                    "round_id": f"round-{index}",
+                    "call_id": f"call-{index}",
+                }),
+                90 - index * 2 - (status == "done"),
+            ))
+
+    conv_id, agent_id, inserted, _ = await _setup(rows_spec)
+    current_anchor = inserted[0].id
+    async with async_session() as db:
+        for row in inserted[1:]:
+            stored = await db.get(ChatMessage, row.id)
+            stored.message_meta = {"turn_anchor_id": str(current_anchor)}
+        await db.commit()
+    _configure_local_storage(monkeypatch, tmp_path)
+    summarize = AsyncMock(side_effect=httpx.ReadTimeout("summary timed out"))
+    monkeypatch.setattr(
+        compactor,
+        "_summarize_via_llm",
+        summarize,
+    )
+
+    try:
+        result = await compactor.maybe_compact(
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            model=_precompact_model(context_window=100, keep=3),
+            last_prompt_tokens=10_000,
+            current_anchor_id=current_anchor,
+        )
+        assert result.triggered is True
+
+        async with async_session() as db:
+            rows = (
+                await db.execute(
+                    _select(ChatMessage)
+                    .where(ChatMessage.conversation_id == conv_id)
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
+            ).scalars().all()
+            from app.services.chat_history import load_recoverable_history_for_turn
+
+            recovered = await load_recoverable_history_for_turn(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                turn_anchor_id=current_anchor,
+                ctx_size=100,
+            )
+            marker = await db.get(ChatCompaction, rows[1].compacted_into)
+
+        anchor = next(row for row in rows if row.id == current_anchor)
+        assert summarize.await_count == 1
+        assert anchor.compacted_into is None
+        assert all(
+            row.compacted_into is not None
+            for row in rows
+            if row.id != current_anchor
+        )
+        assert "<conversation-summary" in recovered[0]["content"]
+        assert recovered[1]["content"] == "持续执行当前自动化任务"
+        assert len(recovered) == 2
+        assert marker is not None
+        assert "summary_llm_error:ReadTimeout" in marker.validation_failure_reason
+        assert "<persisted-output>" in marker.summary_text
+    finally:
+        await _cleanup(conv_id)
+
+
 async def test_consumed_onmessage_event_does_not_block_compaction(monkeypatch):
     from sqlalchemy import select as _select
     from unittest.mock import AsyncMock

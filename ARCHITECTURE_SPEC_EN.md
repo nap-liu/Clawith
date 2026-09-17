@@ -77,9 +77,12 @@ Production nginx configuration is built from `frontend/nginx.conf.template`; a s
 
 - Context budgets derive from the selected model's configured context window,
   configured usage ratio, and provider-reported usage.
-- The current turn is never compacted. Historical compaction operates on
-  complete turns, preserves a configured recent suffix, and archives source
-  material before replacing it with a validated or lossless-fallback summary.
+- Every durable initiator uses the same context-recovery loop. Historical
+  compaction first preserves the configured recent suffix. When the protected
+  current turn itself exceeds the budget, recovery may compact all closed old
+  assistant/tool rounds inside it without a protected-round floor; the durable
+  user anchor and any open tail remain exact. Source material is archived
+  before replacement with a validated or lossless-fallback summary.
 - Explicit provider overflow recovery is finite and may reduce protected
   historical turns to zero only before the current turn has produced external
   side effects; it retries the same current input unchanged.

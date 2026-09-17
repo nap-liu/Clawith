@@ -19,6 +19,7 @@ from app.services.llm.compactor_summary import (
     pin_summary_objective,
     validate_summary,
 )
+from app.services.llm.turn_partition import current_turn_compactable_rows
 
 async def maybe_compact(
     *,
@@ -213,8 +214,9 @@ async def _do_compact(
         # 3. Normal threshold compaction protects the configured suffix. After
         # an explicit provider rejection the caller supplies exactly one lower
         # protection level per retry, eventually reaching zero historical
-        # turns. The current anchored turn remains a separate immutable
-        # partition and is never summarized here.
+        # turns. If there is no historical prefix, a long-running trigger/A2A
+        # turn may compact completed old tool rounds while retaining its user
+        # anchor and recent raw tail.
         if exact_keep_recent_turns:
             selected_keep = max(0, int(keep_recent_turns_override or 0))
         else:
@@ -230,6 +232,22 @@ async def _do_compact(
             minimum_protected_turns=0,
         )
         span_rows = turn_partition.compactable_rows
+        current_turn_span = False
+        if not span_rows:
+            # The provider count says the protected prompt is already unsafe.
+            # At that point protection cannot veto recovery: compact every
+            # closed current-turn round, retaining only the durable user anchor
+            # and any open/malformed tail.
+            span_rows = current_turn_compactable_rows(
+                turn_partition.current,
+                keep_recent_rounds=0,
+            )
+            current_turn_span = bool(span_rows)
+            if current_turn_span:
+                logger.warning(
+                    "[compactor] protected current turn exceeds budget; "
+                    f"using unprotected closed-round compaction session={session_id}"
+                )
         if not span_rows:
             return CompactionResult(
                 triggered=False,
@@ -240,12 +258,33 @@ async def _do_compact(
                 "[compactor] provider-rejection protection level "
                 f"session={session_id} keep_recent_turns={selected_keep}"
             )
-        expected_span_ids = tuple(str(row.id) for row in span_rows)
+        def _span_fingerprint(selected_rows):
+            return tuple(
+                (
+                    str(row.id),
+                    str(getattr(row, "role", "") or ""),
+                    str(getattr(row, "content", "") or ""),
+                    json.dumps(
+                        getattr(row, "message_meta", None) or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                )
+                for row in selected_rows
+            )
+
+        expected_span_fingerprint = _span_fingerprint(span_rows)
+        summary_rows = (
+            [turn_partition.current.user_row, *span_rows]
+            if current_turn_span and turn_partition.current is not None
+            else span_rows
+        )
 
         # 3.5 Internal span sizing is observability only. It must not veto a
         # required compaction because it is not a provider token count.
         span_text = serialize_span_for_summary(
-            span_rows,
+            summary_rows,
             prefilter=False,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
@@ -255,7 +294,7 @@ async def _do_compact(
         # summary provider sees a bounded head/tail view, but that optimization
         # must never make a large requirement in the middle unverifiable.
         unfiltered_span_text = serialize_span_for_summary(
-            span_rows,
+            summary_rows,
             prefilter=False,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
@@ -273,7 +312,7 @@ async def _do_compact(
         # lossless archive. Persisted-output envelope bodies are the sole
         # exception because their complete source already has a durable path.
         durable_elided_span_text = serialize_span_for_summary(
-            span_rows,
+            summary_rows,
             prefilter=False,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
@@ -282,7 +321,7 @@ async def _do_compact(
         prefilter_omitted_inline_content = span_text != durable_elided_span_text
         objective_evidence_items = objective_evidence_items_from_rows(
             prior_summary=prior_summary,
-            rows=span_rows,
+            rows=summary_rows,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
         )
@@ -510,16 +549,19 @@ async def _do_compact(
                 triggered=False,
                 skipped_reason="conversation_changed_during_compaction",
             )
-        fresh_span_ids = tuple(
-            str(row.id)
-            for row in partition_turns(
-                fresh_rows,
-                current_anchor_id=str(current_anchor_id) if current_anchor_id else None,
-                keep_recent_turns=selected_keep,
-                minimum_protected_turns=0,
-            ).compactable_rows
+        fresh_partition = partition_turns(
+            fresh_rows,
+            current_anchor_id=str(current_anchor_id) if current_anchor_id else None,
+            keep_recent_turns=selected_keep,
+            minimum_protected_turns=0,
         )
-        if fresh_span_ids != expected_span_ids:
+        fresh_span = fresh_partition.compactable_rows
+        if current_turn_span and not fresh_span:
+            fresh_span = current_turn_compactable_rows(
+                fresh_partition.current,
+                keep_recent_rounds=0,
+            )
+        if _span_fingerprint(fresh_span) != expected_span_fingerprint:
             await _delete_uncommitted_archive(archive_materialized)
             await db.rollback()
             return CompactionResult(

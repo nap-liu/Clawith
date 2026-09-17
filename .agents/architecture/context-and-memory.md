@@ -32,8 +32,13 @@ the turn. Whole tool-loop timeouts do not belong in channel adapters.
 
 ## Turn partition and compaction
 
-- The current user turn—including its assistant/tool rounds—is an atomic
-  partition. Never summarize, truncate, or rewrite it as historical context.
+- Web, IM, trigger, task, recovery, and A2A turns use one shared context
+  detection, compaction, durable reload, and retry loop.
+- The current user anchor and any open assistant/tool tail are atomic. Closed
+  old assistant/tool rounds in a long-running current turn are normally
+  protected, but when that protected turn itself exceeds the model budget the
+  loop may lower its protected-round floor to zero and summarize those closed
+  rounds. It never rewrites the anchor or an open call.
 - Normal compaction removes only completed older turns and preserves the
   configured recent complete-turn suffix; the supported minimum is three.
 - On an explicit provider context-overflow rejection before any streamed,
@@ -41,8 +46,10 @@ the turn. Whole tool-loop timeouts do not belong in channel adapters.
   protected-turn sizes from N down to zero. Each level is attempted at most
   once, the durable current tail is reloaded, and the current input is retried
   unchanged.
-- If no older complete turn is compressible, return an explicit no-op/provider
-  failure. Never loop recovery indefinitely or discard the active turn.
+- If no older complete turn is compressible, compact closed rounds inside the
+  oversized current turn without a protection floor. Return an explicit
+  provider failure only when the remaining anchor/open tail itself cannot fit.
+  Never loop recovery indefinitely or discard open work.
 
 Compaction is durable and auditable. Materialize and verify the archive before
 committing the compaction marker. A model summary must preserve active goals,
@@ -50,6 +57,11 @@ completed and incomplete work, evidence, blockers, next actions, and relevant
 handoffs. Validation/repair failure falls back to a deterministic lossless
 archive reference; summary quality must not block safe compaction or silently
 lose history.
+
+The compaction model request is a special recovery operation and may use the
+model's full physical context window (100%); the ordinary configured usage
+ratio continues to govern normal Agent dispatch. Provider-reported usage, not
+a character estimate, triggers the transition.
 
 Semantic summary generation and repair use the ordinary model output allowance,
 without a separate summary token cap or character-length acceptance gate. The

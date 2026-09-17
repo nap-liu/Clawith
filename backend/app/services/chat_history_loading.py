@@ -192,10 +192,10 @@ async def load_recoverable_messages_for_turn(
             if str(injected_anchor_id or "") != str(turn_anchor_id):
                 break
         tail.append(row)
-    # Startup recovery must not invent a row boundary either. It cannot safely
-    # compact/replay an already-started turn, so retain the full active prefix;
-    # the stateless dispatch guard will stop if that exact continuation cannot
-    # fit.
+    # Startup recovery must not invent a row boundary. The shared recovery loop
+    # may already have summarized a contiguous prefix of provably closed typed
+    # tool rounds; retain the remaining anchor/open tail exactly and let the
+    # stateless dispatch guard stop if that continuation still cannot fit.
     rows = prefix + causally_prior_rows + tail
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)

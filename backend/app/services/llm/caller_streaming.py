@@ -112,8 +112,7 @@ async def call_llm(
         _warn_threshold_80 = int(state.max_tool_rounds * 0.8)
         _warn_threshold_96 = state.max_tool_rounds - 2
         if round_i == _warn_threshold_80:
-            state.api_messages.append(
-                LLMMessage(
+            warning = LLMMessage(
                     role="user",
                     content=(
                         f"⚠️ 你已使用 {round_i}/{state.max_tool_rounds} 轮工具调用。"
@@ -121,14 +120,15 @@ async def call_llm(
                         "并使用 set_trigger 设置续接触发器，在剩余轮次中做好收尾。"
                     ),
                 )
-            )
+            state.api_messages.append(warning)
+            state.recovery_overlay_messages.append(warning)
         elif round_i == _warn_threshold_96:
-            state.api_messages.append(
-                LLMMessage(
+            warning = LLMMessage(
                     role="user",
                     content="🚨 仅剩 2 轮工具调用。请立即使用 upsert_focus_item 保存进度并设置续接触发器。",
                 )
-            )
+            state.api_messages.append(warning)
+            state.recovery_overlay_messages.append(warning)
 
         dispatch_messages = list(state.api_messages)
 
@@ -201,6 +201,7 @@ async def call_llm(
                 dispatch_budget,
                 round_i + 1,
             )
+            state.recovery_overlay_messages.clear()
             await _call_llm_track_response_usage(state, response, round_i + 1)
             round_outcome = await _call_llm_resume_truncated_response(
                 state,

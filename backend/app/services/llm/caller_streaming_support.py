@@ -59,6 +59,7 @@ class CallLlmState:
     terminal_response_segments: list[str] = field(default_factory=list)
     turn_execution_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     api_messages: list[LLMMessage] = field(default_factory=list)
+    recovery_overlay_messages: list[LLMMessage] = field(default_factory=list)
     preflight_compaction_not_applicable: bool = False
 
 
@@ -436,6 +437,7 @@ async def _call_llm_dispatch_round_with_context_recovery(
                 static_prompt=state.static_prompt,
                 dynamic_prompt=state.dynamic_prompt,
             )
+            state.api_messages.extend(state.recovery_overlay_messages)
             current_messages = list(state.api_messages)
             state.last_authoritative_prompt_tokens = None
             current_budget = measure_dispatch(
@@ -480,6 +482,7 @@ async def _call_llm_apply_preflight_context_recovery(
                 static_prompt=state.static_prompt,
                 dynamic_prompt=state.dynamic_prompt,
             )
+            state.api_messages.extend(state.recovery_overlay_messages)
             dispatch_messages = list(state.api_messages)
             state.last_authoritative_prompt_tokens = None
             dispatch_budget = measure_dispatch(

@@ -35,7 +35,9 @@ from app.services.scene_activation import resolve_session_scene
 def is_channel_command(text: str) -> bool:
     """Check if the message is a recognized channel command."""
     command, arg = _parse_command(text)
-    if command in {"/new", "/reset", "/help", "/stop", "/status", "/continue"}:
+    if command in {
+        "/new", "/reset", "/help", "/commands", "/stop", "/status", "/continue",
+    }:
         return arg is None
     if command in {"/thinking", "/think"}:
         return arg in {"on", "off", "status"}
@@ -116,7 +118,7 @@ async def handle_channel_command(
     cmd = command.strip().lower()
     parsed_cmd, arg = _parse_command(command)
 
-    if parsed_cmd == "/help":
+    if parsed_cmd in {"/help", "/commands"}:
         return {"action": "help", "message": _help_message()}
 
     if parsed_cmd == "/continue" and arg is None:
@@ -395,147 +397,20 @@ async def handle_channel_command(
         }
 
     if parsed_cmd == "/model":
-        from app.services.channel_session import find_or_create_channel_session
-        from app.services.chat_model_selection import (
-            MODEL_OVERRIDE_OK,
-            MODEL_SESSION_CONFIG_KEY,
-            MODEL_STATUS_AMBIGUOUS,
-            MODEL_STATUS_DISABLED,
-            MODEL_STATUS_NOT_FOUND,
-            MODEL_STATUS_OK,
-            list_enabled_tenant_models,
-            resolve_runtime_models,
-            resolve_tenant_model_by_name,
-        )
+        from app.services.channel_model_commands import handle_model_command
 
-        agent = await _load_agent(db, agent_id=agent_id)
-        if agent is None or agent.tenant_id is None:
-            return {"action": "model_failed", "message": "❌ 无法读取数字员工的模型配置。"}
-
-        normalized_arg = str(arg or "status").strip()
-        explicit_use = normalized_arg.casefold().startswith("use ")
-        if explicit_use:
-            normalized_arg = normalized_arg[4:].strip()
-            if not normalized_arg:
-                return {
-                    "action": "model_usage",
-                    "message": "❌ 用法：/model use <模型名>。",
-                }
-        control_arg = "" if explicit_use else normalized_arg.casefold()
-        if control_arg == "list":
-            models = await list_enabled_tenant_models(db, agent.tenant_id)
-            if not models:
-                return {"action": "model_list", "message": "当前企业没有已启用的模型。"}
-            model_names = "\n".join(f"- {model.model}" for model in models)
-            return {
-                "action": "model_list",
-                "message": (
-                    f"可用模型：\n{model_names}\n\n切换方式：/model <模型名>"
-                    "；若模型名为 list、status 或 default，请使用 /model use <模型名>。"
-                ),
-            }
-
-        session = await _load_channel_session(
+        return await handle_model_command(
             db,
+            arg=arg,
             agent_id=agent_id,
+            user_id=user_id,
             external_conv_id=external_conv_id,
             source_channel=source_channel,
-            for_update=control_arg != "status",
+            is_group=is_group,
+            group_name=group_name,
+            load_agent=_load_agent,
+            load_session=_load_channel_session,
         )
-        current_model_id = str((session.im_config or {}).get(MODEL_SESSION_CONFIG_KEY) or "") if session else ""
-
-        if control_arg == "status":
-            resolved = await resolve_runtime_models(
-                db,
-                agent=agent,
-                override_model_id=current_model_id or None,
-            )
-            if current_model_id and resolved.override_status != MODEL_OVERRIDE_OK:
-                return {
-                    "action": "model_status_unavailable",
-                    "message": (
-                        "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，"
-                        "或 /model default 恢复默认模型。"
-                    ),
-                }
-            if resolved.primary_model is None:
-                return {"action": "model_status", "message": "当前数字员工未配置可用模型。"}
-            source = "会话临时模型" if current_model_id else "数字员工默认模型"
-            return {
-                "action": "model_status",
-                "message": f"当前模型：{resolved.primary_model.model}（{source}）。",
-            }
-
-        if control_arg == "default":
-            if session is not None and current_model_id:
-                config = dict(session.im_config or {})
-                config.pop(MODEL_SESSION_CONFIG_KEY, None)
-                session.im_config = config
-                await db.flush()
-            resolved = await resolve_runtime_models(db, agent=agent)
-            if resolved.primary_model is None:
-                return {
-                    "action": "model_default",
-                    "message": "✅ 已清除会话临时模型；数字员工当前没有可用的默认模型。",
-                }
-            return {
-                "action": "model_default",
-                "message": f"✅ 已恢复数字员工默认模型「{resolved.primary_model.model}」，从下一条消息起生效。",
-            }
-
-        matched = await resolve_tenant_model_by_name(
-            db,
-            tenant_id=agent.tenant_id,
-            model_name=normalized_arg,
-        )
-        if matched.status == MODEL_STATUS_NOT_FOUND:
-            return {
-                "action": "model_not_found",
-                "message": f"❌ 未找到模型「{normalized_arg}」，请发送 /model list 查看可用模型。",
-            }
-        if matched.status == MODEL_STATUS_DISABLED:
-            return {
-                "action": "model_disabled",
-                "message": f"❌ 模型「{matched.model.model}」当前已停用，无法切换。",
-            }
-        if matched.status == MODEL_STATUS_AMBIGUOUS:
-            return {
-                "action": "model_ambiguous",
-                "message": f"❌ 存在多个名为「{normalized_arg}」的模型，请管理员调整模型名称。",
-            }
-        if matched.status != MODEL_STATUS_OK or matched.model is None:
-            return {"action": "model_failed", "message": "❌ 模型切换失败，请稍后重试。"}
-
-        if session is None:
-            await find_or_create_channel_session(
-                db=db,
-                agent_id=agent_id,
-                user_id=user_id,
-                external_conv_id=external_conv_id,
-                source_channel=source_channel,
-                first_message_title="New Session",
-                is_group=is_group,
-                group_name=group_name,
-                allow_unresolved_user=True,
-            )
-            session = await _load_channel_session(
-                db,
-                agent_id=agent_id,
-                external_conv_id=external_conv_id,
-                source_channel=source_channel,
-                for_update=True,
-            )
-        if session is None:
-            return {"action": "model_failed", "message": "❌ 模型切换失败，请稍后重试。"}
-
-        config = dict(session.im_config or {})
-        config[MODEL_SESSION_CONFIG_KEY] = str(matched.model.id)
-        session.im_config = config
-        await db.flush()
-        return {
-            "action": "model_switched",
-            "message": f"✅ 已切换到模型「{matched.model.model}」，从下一条消息起生效。",
-        }
 
     if parsed_cmd == "/scene":
         from app.schemas.scene import validate_scene_key

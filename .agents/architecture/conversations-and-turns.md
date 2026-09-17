@@ -450,6 +450,11 @@ under their matching endpoint/model binding; see `context-and-memory.md`.
   Record consumption time separately from immutable arrival time. Model history,
   recovery and compaction use one shared consumption-order projection, so old
   backlog cannot precede its own root or be compacted out of the active turn.
+  If the provider reports that the protected active turn already exceeds its
+  budget, recovery may summarize only the contiguous, typed tool-round prefix
+  whose final call states are all terminal. It stops before any injected user,
+  ordinary assistant, malformed, unknown, or open tool row, preserving that
+  row and the entire remaining active tail exactly.
   Pending inputs are excluded from compaction until consumed. Fresh compaction
   reads refresh ORM state after provider waits.
 - A2A: `(min(agent_a, agent_b), max(...))` is the normalized pair. `ChatMessage.agent_id` can therefore be the smaller UUID for both directions; load A2A history by `conversation_id`.

@@ -143,6 +143,39 @@ def test_native_replay_honors_shared_argument_repair_without_mutating_audit():
     assert response.responses_snapshot["output"][0]["arguments"] == '{"path":"a",}'
 
 
+def test_replay_removes_empty_assistant_messages_and_keeps_complete_tool_pair():
+    client = OpenAIResponsesClient("test", model="model-a")
+    empty_message = {
+        "id": "message-empty", "type": "message", "role": "assistant",
+        "status": "completed", "content": [{"type": "output_text", "text": "   "}],
+    }
+    snapshot = {
+        "protocol": "openai_responses",
+        "endpoint": client._normalize_base_url(),
+        "model": "model-a",
+        "output": [empty_message, OUTPUT[2]],
+    }
+    messages = [
+        LLMMessage("assistant", "", tool_calls=[{
+            "id": "call-1", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"a"}'},
+        }], responses_snapshot=snapshot),
+        LLMMessage("tool", "file text", tool_call_id="call-1"),
+        LLMMessage("assistant", ""),
+        LLMMessage("assistant", "done"),
+    ]
+
+    items = client._messages_to_input(messages)
+
+    assert not any(item.get("role") == "assistant" and not item.get("content") for item in items)
+    assert empty_message not in items
+    assert items == [
+        OUTPUT[2],
+        {"type": "function_call_output", "call_id": "call-1", "output": "file text"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_provider_refusal_is_returned_as_visible_text():
     client = OpenAIResponsesClient("test", model="model-a")

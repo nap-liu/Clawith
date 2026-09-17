@@ -95,6 +95,63 @@ def test_bailian_differences_do_not_apply_to_other_endpoints():
         client._build_payload([], None, None, None, reasoning_effort="none")
 
 
+@pytest.mark.parametrize("model", ["kimi/kimi-k3", "kimi-k3"])
+def test_bailian_kimi_moves_union_parent_types_without_mutating_canonical_tools(model):
+    tools = [{"type": "function", "function": {
+        "name": "delete_trigger",
+        "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "name": {"type": "string"}},
+            "anyOf": [{"required": ["id"]}, {"required": ["name"]}],
+        },
+    }}, {"type": "function", "function": {
+        "name": "send_media",
+        "parameters": {
+            "type": "object",
+            "oneOf": [{"required": ["url"]}, {"required": ["path"]}],
+        },
+    }}]
+    original = json.loads(json.dumps(tools))
+    client = OpenAICompatibleClient("unused", ENDPOINTS[0], model, provider="qwen")
+
+    projected = client._build_payload([], tools, None, None)["tools"]
+
+    assert tools == original
+    for tool, keyword in zip(projected, ("anyOf", "oneOf"), strict=True):
+        schema = tool["function"]["parameters"]
+        assert "type" not in schema
+        assert [branch["type"] for branch in schema[keyword]] == ["object", "object"]
+
+
+def test_bailian_kimi_does_not_rewrite_literal_example_data():
+    tools = [{"type": "function", "function": {
+        "name": "lookup",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "examples": [{"type": "example", "anyOf": ["literal"]}],
+        },
+    }}]
+    client = OpenAICompatibleClient("unused", ENDPOINTS[0], "kimi-k3", provider="qwen")
+
+    projected = client._build_payload([], tools, None, None)["tools"]
+
+    assert projected[0]["function"]["parameters"]["examples"] == [
+        {"type": "example", "anyOf": ["literal"]},
+    ]
+
+
+def test_kimi_union_schema_is_unchanged_outside_bailian():
+    tools = [{"type": "function", "function": {
+        "name": "lookup",
+        "parameters": {"type": "object", "anyOf": [{"required": ["id"]}]},
+    }}]
+    client = OpenAICompatibleClient(
+        "unused", "https://tokenhub.tencentmaas.com/v1", "kimi/kimi-k3", provider="tokenhub",
+    )
+    assert client._build_payload([], tools, None, None)["tools"] == tools
+
+
 def test_fixed_sampling_does_not_silently_ignore_an_override():
     client = OpenAICompatibleClient("unused", ENDPOINTS[0], MODELS[1], provider="qwen")
     assert client._build_payload([], None, 1.0, None)["temperature"] == 1.0

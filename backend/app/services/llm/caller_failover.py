@@ -158,7 +158,15 @@ async def call_llm_with_failover(
                 # useful work is possible. A second provider rejection resumes
                 # at N-1, eventually reaching current-turn-only (zero history).
                 if attempted_keep == 0:
-                    provider_overflow_exhausted = True
+                    # Zero protection is not itself terminal: the first zero
+                    # pass may consume the last historical span, and a second
+                    # zero pass must still be allowed to compact closed rounds
+                    # inside the oversized current turn. Stop only when the
+                    # recovery operation reports that it made no progress.
+                    provider_overflow_exhausted = (
+                        recovered is None
+                        or getattr(recovered, "compacted", None) is not True
+                    )
                 else:
                     next_provider_overflow_keep = attempted_keep - 1
             if recovered is not None or not provider_overflow or attempted_keep == 0:

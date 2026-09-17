@@ -7,13 +7,26 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services.llm.turn_partition import effective_keep_recent_turns, partition_turns
+from app.services.llm.turn_partition import (
+    current_turn_compactable_rows,
+    effective_keep_recent_turns,
+    partition_turns,
+)
 
 
 _BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def _row(role: str, index: int, *, anchor=None, completed=False, status=None, call_id=None):
+def _row(
+    role: str,
+    index: int,
+    *,
+    anchor=None,
+    completed=False,
+    status=None,
+    call_id=None,
+    round_id=None,
+):
     row_id = uuid.uuid4()
     meta = {}
     if anchor is not None:
@@ -26,6 +39,7 @@ def _row(role: str, index: int, *, anchor=None, completed=False, status=None, ca
             {
                 "status": status or "done",
                 **({"call_id": call_id} if call_id else {}),
+                **({"round_id": round_id} if round_id else {}),
             }
         )
     return SimpleNamespace(
@@ -233,6 +247,114 @@ def test_current_anchor_is_separate_and_never_compactable():
     assert list(partition.current.rows) == [current]
     assert current not in partition.compactable_rows
     assert current not in partition.protected_rows
+
+
+def test_completed_old_rounds_inside_current_turn_can_be_compacted():
+    current = _row("user", 2000)
+    rows = [current]
+    for index in range(6):
+        row = _row(
+            "tool_call", 2001 + index, anchor=current.id,
+            status="done", call_id=f"call-{index}",
+        )
+        payload = json.loads(row.content)
+        payload["round_id"] = f"round-{index}"
+        row.content = json.dumps(payload)
+        rows.append(row)
+    partition = partition_turns(
+        rows, current_anchor_id=str(current.id), keep_recent_turns=3,
+    )
+
+    assert current_turn_compactable_rows(partition.current) == rows[1:4]
+    assert current_turn_compactable_rows(
+        partition.current, keep_recent_rounds=0,
+    ) == rows[1:]
+    assert current not in current_turn_compactable_rows(partition.current)
+
+
+def test_current_turn_compaction_never_crosses_open_tool_round():
+    current = _row("user", 3000)
+    closed = [
+        _row("tool_call", 3001 + index, anchor=current.id, status="done")
+        for index in range(5)
+    ]
+    pending = _row("tool_call", 3010, anchor=current.id, status="pending")
+    later = _row("tool_call", 3011, anchor=current.id, status="done")
+    partition = partition_turns(
+        [current, *closed, pending, later],
+        current_anchor_id=str(current.id),
+        keep_recent_turns=3,
+    )
+
+    assert current_turn_compactable_rows(partition.current) == closed[:2]
+
+
+def test_current_turn_compaction_uses_final_state_of_persisted_tool_calls():
+    current = _row("user", 4000)
+    first_round = [
+        _row(
+            "tool_call", 4001 + index, anchor=current.id, status=status,
+            call_id=call_id, round_id="round-1",
+        )
+        for index, (call_id, status) in enumerate((
+            ("call-a", "running"),
+            ("call-b", "running"),
+            ("call-a", "done"),
+            ("call-b", "done"),
+        ))
+    ]
+    second_running = _row(
+        "tool_call", 4010, anchor=current.id, status="running",
+        call_id="call-c", round_id="round-2",
+    )
+    partition = partition_turns(
+        [current, *first_round, second_running],
+        current_anchor_id=str(current.id),
+    )
+
+    assert current_turn_compactable_rows(
+        partition.current, keep_recent_rounds=0,
+    ) == first_round
+
+
+def test_current_turn_compaction_protects_injected_user_and_later_rows():
+    current = _row("user", 5000)
+    first_round = [
+        _row(
+            "tool_call", 5001 + index, anchor=current.id, status=status,
+            call_id="call-a", round_id="round-1",
+        )
+        for index, status in enumerate(("running", "done"))
+    ]
+    injected = _row("user", 5003)
+    later = _row(
+        "tool_call", 5004, anchor=current.id, status="done",
+        call_id="call-b", round_id="round-2",
+    )
+    partition = partition_turns(
+        [current, *first_round, injected, later],
+        current_anchor_id=str(current.id),
+    )
+
+    assert current_turn_compactable_rows(
+        partition.current, keep_recent_rounds=0,
+    ) == first_round
+
+
+def test_current_turn_compaction_rejects_cross_anchor_tool_rows():
+    current = _row("user", 6000)
+    late_prior = _row(
+        "tool_call", 6001, anchor=uuid.uuid4(), status="done",
+        call_id="prior-call", round_id="prior-round",
+    )
+    partition = partition_turns(
+        [current, late_prior],
+        current_anchor_id=str(current.id),
+    )
+
+    assert current_turn_compactable_rows(
+        partition.current, keep_recent_rounds=0,
+    ) == []
 
 
 @pytest.mark.parametrize("injection_kind", ["im", "subagent"])

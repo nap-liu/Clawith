@@ -209,9 +209,16 @@ COMPACTION_NOT_APPLICABLE_REASONS = frozenset(
 class ContextRecoveryMessages(list):
     """Reloaded durable view plus a typed preflight no-op classification."""
 
-    def __init__(self, values=(), *, preflight_not_applicable: bool = False):
+    def __init__(
+        self,
+        values=(),
+        *,
+        preflight_not_applicable: bool = False,
+        compacted: bool | None = None,
+    ):
         super().__init__(values)
         self.preflight_not_applicable = preflight_not_applicable
+        self.compacted = compacted
 
 
 # ─── Trigger decision ────────────────────────────────────────────────

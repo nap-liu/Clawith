@@ -292,64 +292,19 @@ async def run_llm_and_stream_impl(
 
             context_recovery = None
             if turn_anchor_id is not None and persisted_view:
-                from app.services.llm.turn_partition import effective_keep_recent_turns
+                from app.services.llm.context_recovery import build_context_recovery
 
-                protected_keep_recent_turns = effective_keep_recent_turns(
-                    effective_llm_model,
-                    self.fallback_llm_model,
+                context_recovery = build_context_recovery(
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                    turn_anchor_id=turn_anchor_id,
+                    ctx_size=self.ctx_size,
+                    primary_model=effective_llm_model,
+                    fallback_model=self.fallback_llm_model,
+                    include_thinking=True,
+                    prefix_messages=ephemeral_overlays,
+                    on_recovered=lambda recovered: setattr(self, "conversation", recovered),
                 )
-
-                async def _recover_context(_recovery_model, dispatch_budget):
-                    from app.services.chat_history import load_recoverable_history_for_turn
-                    from app.services.llm.compactor import (
-                        COMPACTION_NOT_APPLICABLE_REASONS,
-                        ContextRecoveryMessages,
-                        maybe_compact,
-                    )
-
-                    compacted = await maybe_compact(
-                        agent_id=self.agent_id,
-                        conversation_id=self.conv_id,
-                        model=_recovery_model,
-                        last_prompt_tokens=getattr(dispatch_budget, "authoritative_prompt_tokens", None),
-                        current_anchor_id=turn_anchor_id,
-                        force_required=getattr(dispatch_budget, "provider_overflow", False),
-                        keep_recent_turns_override=(
-                            getattr(dispatch_budget, "keep_recent_turns_override", None)
-                            if getattr(dispatch_budget, "provider_overflow", False)
-                            else protected_keep_recent_turns
-                        ),
-                    )
-                    preflight_not_applicable = (
-                        not compacted.triggered
-                        and compacted.skipped_reason in COMPACTION_NOT_APPLICABLE_REASONS
-                        and dispatch_budget.fits
-                    )
-                    if not compacted.triggered and not preflight_not_applicable:
-                        api.logger.warning(
-                            "[WS] context recovery could not compact session="
-                            f"{self.conv_id}: {compacted.skipped_reason}"
-                        )
-                        return None
-                    async with api.async_session() as recovery_db:
-                        recovered = await load_recoverable_history_for_turn(
-                            recovery_db,
-                            agent_id=self.agent_id,
-                            conversation_id=self.conv_id,
-                            turn_anchor_id=turn_anchor_id,
-                            ctx_size=self.ctx_size,
-                            include_thinking=True,
-                        )
-                    if not recovered:
-                        api.logger.warning(f"[WS] context recovery lost latest-anchor race session={self.conv_id}")
-                        return None
-                    self.conversation = recovered
-                    return ContextRecoveryMessages(
-                        ephemeral_overlays + self.conversation,
-                        preflight_not_applicable=preflight_not_applicable,
-                    )
-
-                context_recovery = _recover_context
 
             live_code_chars_sent = 0
             live_code_truncated_sent = False

@@ -219,10 +219,21 @@ async def test_context_rejection_after_stream_progress_is_not_replayed(monkeypat
 
 async def test_provider_rejection_degrades_one_protected_turn_per_retry(monkeypatch):
     observed_keeps: list[int | None] = []
+    zero_passes = 0
 
     async def recovery(_model, budget):
+        nonlocal zero_passes
+        from app.services.llm.compactor import ContextRecoveryMessages
+
         observed_keeps.append(budget.keep_recent_turns_override)
-        return [{"role": "user", "content": f"keep={budget.keep_recent_turns_override}"}]
+        if budget.keep_recent_turns_override == 0:
+            zero_passes += 1
+            if zero_passes == 3:
+                return None
+        return ContextRecoveryMessages(
+            [{"role": "user", "content": f"keep={budget.keep_recent_turns_override}:{zero_passes}"}],
+            compacted=True,
+        )
 
     async def fake_call(model, *_args, context_recovery=None, **_kwargs):
         budget = DispatchBudget(
@@ -234,7 +245,7 @@ async def test_provider_rejection_degrades_one_protected_turn_per_retry(monkeypa
             token_overflow=True,
             provider_overflow=True,
         )
-        for _ in range(4):
+        for _ in range(5):
             assert await context_recovery(model, budget) is not None
         assert await context_recovery(model, budget) is None
         return "ok"
@@ -256,7 +267,7 @@ async def test_provider_rejection_degrades_one_protected_turn_per_retry(monkeypa
     )
 
     assert result == "ok"
-    assert observed_keeps == [3, 2, 1, 0]
+    assert observed_keeps == [3, 2, 1, 0, 0, 0]
 
 
 async def test_plain_final_round_uses_actual_usage_for_post_round_compaction(monkeypatch):

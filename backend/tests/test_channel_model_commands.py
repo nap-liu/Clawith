@@ -26,15 +26,19 @@ async def test_model_command_switches_by_saved_model_name(monkeypatch):
         return session
 
     async def fake_resolve(*_args, **kwargs):
-        assert kwargs["model_name"] == "qwen3.5-plus"
+        assert kwargs["reference"] == "qwen3.5-plus"
         return chat_model_selection.ModelNameResolution(
             chat_model_selection.MODEL_STATUS_OK,
             SimpleNamespace(id=model_id, model="qwen3.5-plus"),
         )
 
+    async def fake_list(*_args, **_kwargs):
+        return []
+
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
-    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_name", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_reference", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
     db = FakeDB()
 
     result = await channel_commands.handle_channel_command(
@@ -75,15 +79,19 @@ async def test_model_command_selects_reserved_saved_name_with_use(
         return session
 
     async def fake_resolve(*_args, **kwargs):
-        assert kwargs["model_name"] == reserved_name
+        assert kwargs["reference"] == reserved_name
         return chat_model_selection.ModelNameResolution(
             chat_model_selection.MODEL_STATUS_OK,
             SimpleNamespace(id=model_id, model=reserved_name),
         )
 
+    async def fake_list(*_args, **_kwargs):
+        return []
+
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
-    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_name", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_reference", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
 
     result = await channel_commands.handle_channel_command(
         db=FakeDB(),
@@ -127,9 +135,13 @@ async def test_model_command_reports_precise_selection_failure(
     async def fake_resolve(*_args, **_kwargs):
         return chat_model_selection.ModelNameResolution(status, model)
 
+    async def fake_list(*_args, **_kwargs):
+        return []
+
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
-    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_name", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_reference", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
 
     result = await channel_commands.handle_channel_command(
         db=FakeDB(),
@@ -182,7 +194,7 @@ async def test_model_status_reports_stale_session_override(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_list_shows_saved_model_names_without_labels_or_internal_ids(monkeypatch):
+async def test_model_list_shows_human_readable_selector_without_internal_id(monkeypatch):
     from app.services import chat_model_selection
 
     model_id = uuid.uuid4()
@@ -195,6 +207,7 @@ async def test_model_list_shows_saved_model_names_without_labels_or_internal_ids
         return [
             SimpleNamespace(
                 id=model_id,
+                provider="qwen",
                 model="qwen3.5-plus",
                 label="企业 GPT 旗舰版",
             )
@@ -214,8 +227,126 @@ async def test_model_list_shows_saved_model_names_without_labels_or_internal_ids
 
     assert result["action"] == "model_list"
     assert "qwen3.5-plus" in result["message"]
-    assert "企业 GPT 旗舰版" not in result["message"]
+    assert "企业 GPT 旗舰版" in result["message"]
+    assert "/model 企业 GPT 旗舰版" in result["message"]
     assert str(model_id) not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_model_names_use_readable_ordinal_selector(monkeypatch):
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    first_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    second_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    models = [
+        SimpleNamespace(
+            id=first_id, provider="qwen", model="qwen3.8-max", label="use 旗舰模型",
+        ),
+        SimpleNamespace(
+            id=second_id, provider="qwen", model="qwen3.8-plus", label="use 旗舰模型",
+        ),
+    ]
+    session = SimpleNamespace(im_config={})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_list(*_args, **_kwargs):
+        return models
+
+    from app.services import chat_model_selection
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
+
+    listed = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/model list",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_1",
+        source_channel="feishu",
+    )
+    first_code = str(first_id).replace("-", "")[:6]
+    second_code = str(second_id).replace("-", "")[:6]
+    assert f"/model pick use 旗舰模型 @{first_code}" in listed["message"]
+    assert f"/model pick use 旗舰模型 @{second_code}" in listed["message"]
+    assert str(first_id) not in listed["message"]
+    assert str(second_id) not in listed["message"]
+
+    switched = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command=f"/model pick use 旗舰模型 @{second_code}",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_1",
+        source_channel="feishu",
+    )
+    assert switched["action"] == "model_switched"
+    assert session.im_config == {"model_id": str(second_id)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "copyable_command"),
+    [
+        ("use alpha", "/model use use alpha"),
+        ("Alpha #2", "/model Alpha #2"),
+    ],
+)
+async def test_literal_model_labels_have_copyable_escape_command(
+    monkeypatch,
+    label,
+    copyable_command,
+):
+    from app.services import chat_model_selection
+
+    model_id = uuid.uuid4()
+    model = SimpleNamespace(
+        id=model_id,
+        provider="qwen",
+        model="qwen-readable",
+        label=label,
+    )
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(im_config={})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_list(*_args, **_kwargs):
+        return [model]
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
+
+    listed = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/model list",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_literal",
+        source_channel="feishu",
+    )
+    assert copyable_command in listed["message"]
+
+    switched = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command=copyable_command,
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_literal",
+        source_channel="feishu",
+    )
+    assert switched["action"] == "model_switched"
+    assert session.im_config == {"model_id": str(model_id)}
 
 
 @pytest.mark.asyncio

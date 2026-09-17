@@ -1,6 +1,7 @@
 from app.services.llm.client_shared import *  # noqa: F401,F403
 from app.services.llm.provider_parameters import (
     merge_request_headers,
+    normalize_chat_tools,
     supports_default_tool_choice,
     validate_chat_parameters,
 )
@@ -157,7 +158,9 @@ class OpenAICompatibleClient(LLMClient):
             payload["max_tokens"] = max_tokens
 
         if tools:
-            payload["tools"] = tools
+            payload["tools"] = normalize_chat_tools(
+                tools, model=self.model, base_url=self.base_url,
+            )
             if self.supports_tool_choice and supports_default_tool_choice(
                 model=self.model, base_url=self.base_url,
             ):

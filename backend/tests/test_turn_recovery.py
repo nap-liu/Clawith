@@ -176,8 +176,8 @@ async def test_call_agent_llm_releases_database_before_provider_dispatch(monkeyp
     }
 
 
-async def test_call_agent_llm_recovery_mode_never_compacts_or_reloads(monkeypatch):
-    """An interrupted turn is never rewritten or replayed during recovery."""
+async def test_call_agent_llm_recovery_mode_can_compact_completed_history(monkeypatch):
+    """A recovered trigger can compact closed work without adding a user row."""
     import app.services.llm as llm_module
     from app.services.channel_llm import _call_agent_llm
 
@@ -190,11 +190,7 @@ async def test_call_agent_llm_recovery_mode_never_compacts_or_reloads(monkeypatc
         captured["context_recovery"] = kwargs.get("context_recovery")
         return "done"
 
-    async def must_not_compact(**_kwargs):
-        raise AssertionError("recovery continuations must never compact")
-
     monkeypatch.setattr(llm_module, "call_llm_with_failover", fake_failover)
-    monkeypatch.setattr("app.services.llm.compactor.maybe_compact", must_not_compact)
 
     async with async_session() as db:
         reply = await _call_agent_llm(
@@ -211,6 +207,42 @@ async def test_call_agent_llm_recovery_mode_never_compacts_or_reloads(monkeypatc
 
     assert reply == "done"
     assert captured["messages"] == [{"role": "user", "content": "interrupted question"}]
+    assert captured["context_recovery"] is not None
+
+
+async def test_synthetic_project_correction_does_not_enable_context_recovery(monkeypatch):
+    """A non-durable correction prompt must survive unchanged in one retry."""
+    import app.services.llm as llm_module
+    from app.services.channel_llm import _call_agent_llm
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=2)
+    captured: dict = {}
+
+    async def fake_failover(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        captured["context_recovery"] = kwargs.get("context_recovery")
+        return "corrected"
+
+    monkeypatch.setattr(llm_module, "call_llm_with_failover", fake_failover)
+
+    async with async_session() as db:
+        reply = await _call_agent_llm(
+            db,
+            agent_id=agent_id,
+            user_text="synthetic correction",
+            session_id=str(uuid.uuid4()),
+            user_id=user_id,
+            history=[{"role": "assistant", "content": "draft"}],
+            continue_turn=False,
+            recovery_mode=True,
+            turn_anchor_id=uuid.uuid4(),
+        )
+
+    assert reply == "corrected"
+    assert captured["messages"][-1] == {
+        "role": "user",
+        "content": "synthetic correction",
+    }
     assert captured["context_recovery"] is None
 
 

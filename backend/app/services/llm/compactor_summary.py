@@ -12,10 +12,12 @@ _PATH_RE = re.compile(r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|s
 _ATTACHMENT_PATH_RE = re.compile(r"^路径：(.+)$", re.MULTILINE)
 _URL_RE = re.compile(r"\bhttps?://[^\s'\"<>]*?(?=[\s,;!?]|$)", re.IGNORECASE)
 _SLASH_COMMAND_RE = re.compile(
-    r"(?<!\S)/(?:new|reset|help|stop|thinking|think)(?:\s+(?:on|off|status))?(?=[\s,;:!?]|$)",
+    r"(?<!\S)/(?:new|reset|help|commands|stop|thinking|think)(?:\s+(?:on|off|status))?(?=[\s,;:!?]|$)",
     re.IGNORECASE,
 )
-_KNOWN_SLASH_COMMANDS = {"/new", "/reset", "/help", "/stop", "/thinking", "/think"}
+_KNOWN_SLASH_COMMANDS = {
+    "/new", "/reset", "/help", "/commands", "/stop", "/thinking", "/think",
+}
 _HEADING_RE = re.compile(r"^#{2,3}\s", re.MULTILINE)
 _CURRENT_OBJECTIVE_HEADING_RE = re.compile(
     r"^###\s+Current objective and progress\s*$",

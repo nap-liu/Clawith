@@ -4,6 +4,33 @@ from copy import deepcopy
 from app.services.llm.responses_stream import stream_response
 from app.services.llm.provider_parameters import merge_request_headers
 
+
+def _is_empty_assistant_message(item: dict[str, Any]) -> bool:
+    if item.get("role") != "assistant":
+        return False
+    content = item.get("content")
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if not isinstance(content, list):
+        return False
+    if not content:
+        return True
+    for part in content:
+        if not isinstance(part, dict):
+            if part:
+                return False
+            continue
+        part_type = part.get("type")
+        if part_type not in {"output_text", "input_text", "text", "refusal"}:
+            return False
+        value = part.get("refusal") if part_type == "refusal" else part.get("text")
+        if str(value or "").strip():
+            return False
+    return True
+
+
 class OpenAIResponsesClient(LLMClient):
     """Client for OpenAI Responses API (`/v1/responses`)."""
 
@@ -155,11 +182,14 @@ class OpenAIResponsesClient(LLMClient):
 
     @staticmethod
     def _sanitize_input_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove orphaned function_call_output items that have no matching function_call.
+        """Remove empty assistant messages and incomplete function-call pairs.
 
-        Also removes function_call items whose function_call_output is missing,
-        since the Responses API requires complete pairs.
+        Some compatible Responses providers reject an assistant ``message``
+        whose content is empty. Native response snapshots can contain such an
+        item next to a valid function call, so sanitize the final wire input.
         """
+        items = [item for item in items if not _is_empty_assistant_message(item)]
+
         # Collect all call_ids from function_call items
         call_ids_with_fc: set[str] = set()
         for item in items:
@@ -206,7 +236,6 @@ class OpenAIResponsesClient(LLMClient):
                 or (item.get("type") == "function_call" and item.get("call_id", "") in orphaned_fc)
             )
         ]
-
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """Convert OpenAI tool schema to Responses API function tool schema."""
         if not tools:

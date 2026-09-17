@@ -362,64 +362,27 @@ async def _call_agent_llm(
                     current_message["attachments"] = attachments
         messages.append(current_message)
 
-    # Exact first-dispatch recovery. Only a fresh, durably anchored user turn
-    # is eligible; confirmation/startup continuations retain their in-memory
-    # transcript and fail safely rather than risking a replay.
+    # Every durable turn, including startup/background recovery, uses the same
+    # compact/reload operation. A confirmation continuation remains excluded
+    # because it intentionally resumes an unpaired pending tool call.
     context_recovery = None
-    if session_id and turn_anchor_id is not None and not continue_turn and not recovery_mode:
-        from app.services.llm.turn_partition import effective_keep_recent_turns
+    if (
+        session_id
+        and turn_anchor_id is not None
+        and (continue_turn == recovery_mode)
+    ):
+        from app.services.llm.context_recovery import build_context_recovery
 
-        protected_keep_recent_turns = effective_keep_recent_turns(model, fallback_model)
-
-        async def _recover_context(_recovery_model, dispatch_budget):
-            from app.services.chat_history import load_recoverable_history_for_turn
-            from app.services.llm.compactor import (
-                COMPACTION_NOT_APPLICABLE_REASONS,
-                ContextRecoveryMessages,
-                maybe_compact,
-            )
-
-            compacted = await maybe_compact(
-                agent_id=history_agent_id,
-                conversation_id=session_id,
-                model=_recovery_model,
-                last_prompt_tokens=getattr(dispatch_budget, "authoritative_prompt_tokens", None),
-                current_anchor_id=turn_anchor_id,
-                force_required=getattr(dispatch_budget, "provider_overflow", False),
-                keep_recent_turns_override=(
-                    getattr(dispatch_budget, "keep_recent_turns_override", None)
-                    if getattr(dispatch_budget, "provider_overflow", False)
-                    else protected_keep_recent_turns
-                ),
-            )
-            preflight_not_applicable = (
-                not compacted.triggered
-                and compacted.skipped_reason in COMPACTION_NOT_APPLICABLE_REASONS
-                and dispatch_budget.fits
-            )
-            if not compacted.triggered and not preflight_not_applicable:
-                logger.warning(
-                    f"[Channel] context recovery could not compact session={session_id}: {compacted.skipped_reason}"
-                )
-                return None
-            async with async_session() as recovery_db:
-                recovered = await load_recoverable_history_for_turn(
-                    recovery_db,
-                    agent_id=history_agent_id,
-                    conversation_id=session_id,
-                    turn_anchor_id=turn_anchor_id,
-                    ctx_size=ctx_size,
-                    is_group=is_group,
-                )
-            if not recovered:
-                logger.warning(f"[Channel] context recovery lost latest-anchor race session={session_id}")
-                return None
-            return ContextRecoveryMessages(
-                _normalize_history_messages(recovered),
-                preflight_not_applicable=preflight_not_applicable,
-            )
-
-        context_recovery = _recover_context
+        context_recovery = build_context_recovery(
+            agent_id=history_agent_id,
+            conversation_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+            ctx_size=ctx_size,
+            primary_model=model,
+            fallback_model=fallback_model,
+            is_group=is_group,
+            normalize=_normalize_history_messages,
+        )
 
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id

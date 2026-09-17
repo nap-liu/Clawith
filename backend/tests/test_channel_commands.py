@@ -136,6 +136,7 @@ async def test_is_channel_command_recognises_slash_commands():
     assert channel_commands.is_channel_command("/new") is True
     assert channel_commands.is_channel_command("/reset") is True
     assert channel_commands.is_channel_command("/help") is True
+    assert channel_commands.is_channel_command("/commands") is True
     assert channel_commands.is_channel_command("/stop") is True
     assert channel_commands.is_channel_command("/status") is True
     assert channel_commands.is_channel_command("/thinking on") is True
@@ -183,6 +184,17 @@ async def test_help_command_lists_available_im_commands():
     assert "/stop" in result["message"]
     assert "/status" in result["message"]
     assert "/help" in result["message"]
+
+    commands_result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/commands",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_staff_1",
+        source_channel="dingtalk",
+    )
+    assert commands_result == result
+    assert "可用指令" in commands_result["message"]
 
 
 @pytest.mark.parametrize(
