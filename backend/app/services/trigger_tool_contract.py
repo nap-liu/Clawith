@@ -229,6 +229,24 @@ TRIGGER_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "delete_trigger",
+        "display_name": "Delete Trigger",
+        "description": "Delete a disabled trigger you no longer need. Cancel active triggers first. Past runs remain in history.",
+        "category": "aware",
+        "icon": "🗑️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Trigger name"},
+                "id": {"type": "string", "description": "Trigger ID"},
+            },
+            "anyOf": [{"required": ["name"]}, {"required": ["id"]}],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "list_triggers",
         "display_name": "List Triggers",
         "description": "Read complete trigger configuration, reason, options, status and limits. Optional exact "

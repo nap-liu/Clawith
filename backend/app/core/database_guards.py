@@ -329,6 +329,74 @@ CURRENT_DATABASE_GUARDS = (
             FOR EACH ROW EXECUTE FUNCTION enforce_task_supervision_target_tenant()
         """,
     ),
+    DatabaseGuard(
+        table="trigger_executions",
+        trigger="snapshot_trigger_execution_source",
+        function_sql="""
+            CREATE OR REPLACE FUNCTION snapshot_trigger_execution_source()
+            RETURNS trigger AS $$
+            DECLARE source_name varchar(100);
+            BEGIN
+                SELECT name INTO source_name
+                FROM agent_triggers
+                WHERE id = NEW.trigger_id
+                FOR KEY SHARE;
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'Trigger no longer exists'
+                        USING ERRCODE = 'foreign_key_violation';
+                END IF;
+                IF NEW.trigger_name = '' THEN
+                    NEW.trigger_name = source_name;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """,
+        trigger_sql="""
+            CREATE TRIGGER snapshot_trigger_execution_source
+            BEFORE INSERT OR UPDATE OF trigger_id ON trigger_executions
+            FOR EACH ROW EXECUTE FUNCTION snapshot_trigger_execution_source()
+        """,
+    ),
+    DatabaseGuard(
+        table="agent_triggers",
+        trigger="protect_trigger_definition_delete",
+        function_sql="""
+            CREATE OR REPLACE FUNCTION protect_trigger_definition_delete()
+            RETURNS trigger AS $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM agents WHERE id = OLD.agent_id) THEN
+                    RETURN OLD;
+                END IF;
+                IF OLD.is_system THEN
+                    RAISE EXCEPTION 'System triggers cannot be deleted'
+                        USING ERRCODE = 'check_violation';
+                END IF;
+                IF OLD.is_enabled THEN
+                    RAISE EXCEPTION 'Cancel the trigger before deleting it'
+                        USING ERRCODE = 'check_violation';
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM trigger_executions
+                    WHERE trigger_id = OLD.id
+                      AND status IN ('pending', 'processing')
+                ) THEN
+                    RAISE EXCEPTION 'Wait for the current run to finish before deleting it'
+                        USING ERRCODE = 'check_violation';
+                END IF;
+                UPDATE trigger_executions
+                SET trigger_name = OLD.name
+                WHERE trigger_id = OLD.id AND trigger_name = '';
+                RETURN OLD;
+            END;
+            $$ LANGUAGE plpgsql
+        """,
+        trigger_sql="""
+            CREATE TRIGGER protect_trigger_definition_delete
+            BEFORE DELETE ON agent_triggers
+            FOR EACH ROW EXECUTE FUNCTION protect_trigger_definition_delete()
+        """,
+    ),
 )
 
 

@@ -89,7 +89,8 @@ async def set_agent_trigger_impl(ctx, agent, name, type, config, reason,
 
 # ── E3: delete_agent_trigger ──
 async def delete_agent_trigger_impl(ctx, agent, trigger) -> str:
-    from app.models.trigger import AgentTrigger
+    from app.services.trigger_deletion import TriggerDeletionError, delete_trigger_definition
+
     async with async_session() as db:
         pc, err = await authed_write(ctx, db)
         if err:
@@ -97,22 +98,26 @@ async def delete_agent_trigger_impl(ctx, agent, trigger) -> str:
         ag, err = await resolve_manageable_agent(db, pc, agent)
         if err:
             return err
-        q = select(AgentTrigger).where(AgentTrigger.agent_id == ag.id)
-        row = None
         try:
-            tid = _uuid.UUID(str(trigger))
-            row = (await db.execute(q.where(AgentTrigger.id == tid))).scalar_one_or_none()
+            trigger_id = _uuid.UUID(str(trigger))
+            trigger_name = None
         except (ValueError, TypeError):
-            row = (await db.execute(q.where(AgentTrigger.name == trigger))).scalar_one_or_none()
-        if row is None:
-            return (
-                f"❌ 找不到该触发器（你传入了 {trigger!r}，按 name 或 id 指定）。"
-                "用 list_agent_triggers 查看该 agent 的触发器及其 id/名字，再重试。"
+            trigger_id = None
+            trigger_name = str(trigger)
+        try:
+            deleted = await delete_trigger_definition(
+                db,
+                agent_id=ag.id,
+                trigger_id=trigger_id,
+                name=trigger_name,
             )
-        tname = row.name
-        await db.delete(row)
+        except TriggerDeletionError as exc:
+            return (
+                f"❌ 无法删除触发器（你传入了 {trigger!r}）：{exc}。"
+                "请先停用触发器并等待执行完成，再重试。"
+            )
         await db.commit()
-        return f"✅ 已删除「{ag.name}」的触发器：{tname}。"
+        return f"✅ 已删除「{ag.name}」的触发器：{deleted.name}；历史执行记录已保留。"
 
 
 @mcp.tool()

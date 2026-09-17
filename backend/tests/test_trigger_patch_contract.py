@@ -2,22 +2,34 @@
 
 import asyncio
 import json
+import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from fastapi import HTTPException
 
 from app.database import async_session
+from app.models.chat_session import ChatSession
+from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 from app.models.agent import Agent
 from app.models.user import User
 from app.services.agent_tools_trigger_management import (
     _handle_update_trigger,
     _handle_list_triggers,
     _handle_cancel_trigger,
+    _handle_delete_trigger,
 )
 from app.services.agent_tools_trigger_ops import _handle_set_trigger
-from app.api.triggers import update_trigger, TriggerUpdate
+from app.api.triggers import (
+    TriggerUpdate,
+    delete_trigger as delete_trigger_api,
+    list_trigger_executions,
+    update_trigger,
+)
+from app.services.trigger_runtime.queue import enqueue_trigger_execution
 from tests.test_webhook_trigger_tools import _make_webhook_agent
 from tests.test_webhook_modes import _isolate  # noqa: F401
 
@@ -178,3 +190,287 @@ async def test_reenable_cannot_exceed_agent_limit():
         await db.commit()
     result = await _handle_set_trigger(aid, {'name': 'disabled'})
     assert '❌' in result and 'limit' in result
+
+
+async def test_cancelled_trigger_does_not_consume_trigger_limit():
+    aid = await _make_webhook_agent({"token": "stable"})
+    async with async_session() as db:
+        agent = await db.get(Agent, aid)
+        agent.max_triggers = 1
+        await db.commit()
+    await _handle_cancel_trigger(aid, {"name": "h"})
+
+    created = await _handle_set_trigger(
+        aid,
+        {"name": "replacement", "type": "webhook", "config": {}, "reason": "replacement"},
+    )
+    assert json.loads(created)["ok"] is True
+    async with async_session() as db:
+        triggers = (
+            await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        ).scalars().all()
+    assert len(triggers) == 2
+    assert sum(trigger.is_enabled for trigger in triggers) == 1
+
+
+async def test_delete_disabled_trigger_preserves_terminal_execution_history():
+    aid = await _make_webhook_agent({"token": "stable"})
+    async with async_session() as db:
+        trigger = await db.scalar(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        execution, created = await enqueue_trigger_execution(
+            db,
+            trigger=trigger,
+            source="manual",
+            idempotency_key="delete-history",
+            commit=False,
+        )
+        assert created and execution is not None
+        execution.status = "completed"
+        trigger.is_enabled = False
+        trigger_id = trigger.id
+        execution_id = execution.id
+        agent = await db.get(Agent, aid)
+        user = await db.get(User, agent.creator_id)
+        tenant = Tenant(
+            name="Trigger history",
+            slug=f"trigger-history-{str(trigger.id)[:12]}",
+        )
+        db.add(tenant)
+        await db.flush()
+        agent.tenant_id = tenant.id
+        user.tenant_id = tenant.id
+        await db.flush()
+        conversation = ChatSession(
+            agent_id=aid,
+            user_id=user.id,
+            source_channel="web",
+            title="Historical trigger run",
+        )
+        db.add(conversation)
+        await db.flush()
+        execution.conversation_id = conversation.id
+        conversation_id = conversation.id
+        legacy_execution_id = uuid.uuid4()
+        await db.execute(
+            text(
+                """
+                INSERT INTO trigger_executions (
+                    id, trigger_id, agent_id, conversation_id, source, status,
+                    idempotency_key, payload, payload_text
+                ) VALUES (
+                    :id, :trigger_id, :agent_id, :conversation_id, 'manual',
+                    'completed', 'legacy-delete-history', '{}'::jsonb, ''
+                )
+                """
+            ),
+            {
+                "id": legacy_execution_id,
+                "trigger_id": trigger_id,
+                "agent_id": aid,
+                "conversation_id": conversation_id,
+            },
+        )
+        await db.commit()
+
+    deleted = json.loads(await _handle_delete_trigger(aid, {"id": str(trigger_id)}, user_id=user.id))
+    assert deleted["ok"] is True
+    async with async_session() as db:
+        assert await db.get(AgentTrigger, trigger_id) is None
+        history = await db.get(TriggerExecution, execution_id)
+        assert history is not None
+        assert history.trigger_id == trigger_id
+        assert history.trigger_name == "h"
+        assert history.conversation_id == conversation_id
+        assert await db.get(ChatSession, conversation_id) is not None
+        legacy_history = await db.get(TriggerExecution, legacy_execution_id)
+        assert legacy_history is not None
+        assert legacy_history.trigger_name == "h"
+        assert legacy_history.conversation_id == conversation_id
+
+    listed = await list_trigger_executions(aid, limit=100, user=user)
+    assert listed[0].trigger_id == str(trigger_id)
+    assert listed[0].trigger_name == "h"
+
+    recreated = await _handle_set_trigger(
+        aid,
+        {"name": "h", "type": "webhook", "config": {}, "reason": "new definition"},
+        user_id=user.id,
+    )
+    assert json.loads(recreated)["ok"] is True
+
+
+async def test_api_delete_uses_shared_disabled_trigger_contract():
+    aid = await _make_webhook_agent({"token": "stable"})
+    trigger = await row(aid)
+    async with async_session() as db:
+        agent = await db.get(Agent, aid)
+        user = await db.get(User, agent.creator_id)
+
+    with pytest.raises(HTTPException) as active:
+        await delete_trigger_api(aid, trigger.id, user)
+    assert active.value.status_code == 409
+
+    await _handle_cancel_trigger(aid, {"name": "h"})
+    deleted = await delete_trigger_api(aid, trigger.id, user)
+    assert deleted["deleted_trigger"] == {"id": str(trigger.id), "name": "h"}
+    async with async_session() as db:
+        assert await db.get(AgentTrigger, trigger.id) is None
+
+
+async def test_database_guards_legacy_delete_and_enqueue_paths():
+    aid = await _make_webhook_agent({"token": "stable"})
+    trigger = await row(aid)
+
+    async with async_session() as db:
+        with pytest.raises(DBAPIError):
+            await db.execute(
+                text("DELETE FROM agent_triggers WHERE id = :id"),
+                {"id": trigger.id},
+            )
+        await db.rollback()
+
+    await _handle_cancel_trigger(aid, {"name": "h"})
+    execution_id = uuid.uuid4()
+    async with async_session() as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO trigger_executions (
+                    id, trigger_id, agent_id, source, status,
+                    idempotency_key, payload, payload_text
+                ) VALUES (
+                    :id, :trigger_id, :agent_id, 'manual', 'pending',
+                    'legacy-delete-guard', '{}'::jsonb, ''
+                )
+                """
+            ),
+            {"id": execution_id, "trigger_id": trigger.id, "agent_id": aid},
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        execution = await db.get(TriggerExecution, execution_id)
+        assert execution.trigger_name == "h"
+        with pytest.raises(DBAPIError):
+            await db.execute(
+                text("DELETE FROM agent_triggers WHERE id = :id"),
+                {"id": trigger.id},
+            )
+        await db.rollback()
+
+    async with async_session() as db:
+        execution = await db.get(TriggerExecution, execution_id)
+        execution.status = "completed"
+        await db.commit()
+    async with async_session() as db:
+        await db.execute(
+            text("DELETE FROM agent_triggers WHERE id = :id"),
+            {"id": trigger.id},
+        )
+        await db.commit()
+    async with async_session() as db:
+        assert await db.get(AgentTrigger, trigger.id) is None
+        assert (await db.get(TriggerExecution, execution_id)).trigger_name == "h"
+
+
+async def test_agent_delete_keeps_existing_trigger_cascade_behavior():
+    aid = await _make_webhook_agent({"token": "stable"})
+    trigger = await row(aid)
+    async with async_session() as db:
+        agent = await db.get(Agent, aid)
+        await db.delete(agent)
+        await db.commit()
+    async with async_session() as db:
+        assert await db.get(AgentTrigger, trigger.id) is None
+
+
+async def test_delete_trigger_rejects_active_system_and_unfinished_definitions():
+    aid = await _make_webhook_agent({"token": "stable"})
+    assert "Cancel the trigger" in await _handle_delete_trigger(aid, {"name": "h"})
+
+    await _handle_cancel_trigger(aid, {"name": "h"})
+    async with async_session() as db:
+        trigger = await db.scalar(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        execution, _created = await enqueue_trigger_execution(
+            db,
+            trigger=trigger,
+            source="manual",
+            idempotency_key="delete-pending",
+            commit=False,
+        )
+        await db.commit()
+    assert "current run" in await _handle_delete_trigger(aid, {"name": "h"})
+
+    async with async_session() as db:
+        execution = await db.get(TriggerExecution, execution.id)
+        execution.status = "completed"
+        trigger = await db.scalar(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        trigger.is_system = True
+        await db.commit()
+    assert "System triggers" in await _handle_delete_trigger(aid, {"name": "h"})
+
+
+async def test_delete_waits_for_concurrent_enqueue_then_preserves_pending_run():
+    aid = await _make_webhook_agent({"token": "stable"})
+    await _handle_cancel_trigger(aid, {"name": "h"})
+
+    async with async_session() as db:
+        trigger = await db.scalar(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        execution, created = await enqueue_trigger_execution(
+            db,
+            trigger=trigger,
+            source="manual",
+            idempotency_key="delete-race",
+            commit=False,
+        )
+        assert created and execution is not None
+        deleting = asyncio.create_task(_handle_delete_trigger(aid, {"name": "h"}))
+        await asyncio.sleep(0.05)
+        assert not deleting.done()
+        await db.commit()
+
+    result = await asyncio.wait_for(deleting, timeout=2)
+    assert "current run" in result
+    async with async_session() as db:
+        assert await db.get(AgentTrigger, trigger.id) is not None
+        assert await db.get(TriggerExecution, execution.id) is not None
+
+
+async def test_delete_trigger_is_seeded_and_visible_to_existing_standard_agent():
+    from app.models.tool import AgentTool, Tool
+    from app.services.agent_tools import get_agent_tools_for_llm
+    from app.services.tool_seeder import seed_builtin_tools
+
+    aid = await _make_webhook_agent({"token": "stable"})
+    await seed_builtin_tools()
+    async with async_session() as db:
+        tool = await db.scalar(select(Tool).where(Tool.name == "delete_trigger"))
+        assert tool is not None
+        assignment = await db.scalar(
+            select(AgentTool).where(
+                AgentTool.agent_id == aid,
+                AgentTool.tool_id == tool.id,
+            )
+        )
+        if assignment is None:
+            assignment = AgentTool(agent_id=aid, tool_id=tool.id, enabled=True)
+            db.add(assignment)
+        else:
+            assignment.enabled = True
+        await db.commit()
+    assert assignment.enabled
+
+    runtime_tools = await get_agent_tools_for_llm(aid)
+    runtime = {
+        item["function"]["name"]: item["function"]
+        for item in runtime_tools
+        if item.get("type") == "function"
+    }
+    assert runtime["delete_trigger"]["description"] == (
+        "Delete a disabled trigger you no longer need. "
+        "Cancel active triggers first. Past runs remain in history."
+    )
+    assert runtime["delete_trigger"]["parameters"]["anyOf"] == [
+        {"required": ["name"]},
+        {"required": ["id"]},
+    ]

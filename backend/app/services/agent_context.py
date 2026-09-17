@@ -456,7 +456,8 @@ Default visual style for generated HTML or rich visual documents:
      * `on_message` — when a specific agent or human user replies
      * `webhook` — receive external HTTP POST (system auto-generates a unique URL)
    - `update_trigger` — adjust parameters (e.g. change frequency)
-   - `cancel_trigger` — remove triggers when tasks are complete
+   - `cancel_trigger` — disable a trigger without deleting it
+   - `delete_trigger` — delete a disabled trigger you no longer need; past runs remain in history
    - `list_triggers` — see your active triggers
    - When creating triggers related to a Focus item, set `focus_ref` to the item's identifier
 

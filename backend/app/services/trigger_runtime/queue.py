@@ -6,6 +6,7 @@ import hashlib
 from datetime import datetime, timezone
 
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,14 +50,27 @@ async def enqueue_trigger_execution(
 ) -> tuple[TriggerExecution | None, bool]:
     """Insert a generic trigger execution record."""
     trigger_id = trigger.id
+    locked_trigger = (
+        await db.execute(
+            select(AgentTrigger)
+            .where(AgentTrigger.id == trigger_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_trigger is None:
+        raise ValueError("Trigger no longer exists")
+    if source != "manual" and not locked_trigger.is_enabled:
+        raise ValueError("Trigger is disabled")
+
     canonical_scheduled_at = scheduled_at or datetime.now(timezone.utc)
     if canonical_scheduled_at.tzinfo is None:
         raise ValueError("scheduled_at must be timezone-aware")
     canonical_scheduled_at = canonical_scheduled_at.astimezone(timezone.utc)
     execution = TriggerExecution(
-        trigger_id=trigger.id,
-        agent_id=trigger.agent_id,
-        execution_user_id=trigger.execution_user_id,
+        trigger_id=locked_trigger.id,
+        trigger_name=locked_trigger.name,
+        agent_id=locked_trigger.agent_id,
+        execution_user_id=locked_trigger.execution_user_id,
         source=source,
         status="pending",
         idempotency_key=idempotency_key[:255],

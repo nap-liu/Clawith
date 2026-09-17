@@ -59,6 +59,7 @@
     "agentbay_file_transfer": {"name": "AgentBay 文件传输", "description": "在工作区、无头浏览器、云桌面和代码沙箱之间传输文件。"},
     "atlassian_rovo": {"name": "Atlassian Rovo 协作", "description": "连接 Rovo MCP 服务以管理 Jira、Confluence 和 Compass 内容。"},
     "cancel_trigger": {"name": "取消触发器", "description": "按名称停用不再需要的触发器。"},
+    "delete_trigger": {"name": "删除触发器", "description": "删除已停用的触发器，历史运行记录会保留。"},
     "list_triggers": {"name": "列出触发器", "description": "列出当前 Agent 的触发器及其创建者和执行用户。"},
     "set_trigger": {"name": "设置触发器", "description": "创建定时、轮询、消息或 Webhook 触发器，在指定条件下唤醒 Agent。"},
     "update_trigger": {"name": "更新触发器", "description": "调整现有触发器的时间、条件、参数或唤醒原因。"},

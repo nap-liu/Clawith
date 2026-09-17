@@ -102,7 +102,7 @@ def assert_schema_ready(url):
     } <= tables
     for name in INDEX_NAMES:
         assert execute(url, f"SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass('{name}')") == [(True,)]
-    assert execute(url, "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")[0][0] == 7
+    assert execute(url, "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")[0][0] == 9
 
 
 @pytest.mark.parametrize("kind", ["module", "entrypoint", "alembic"])

@@ -25,6 +25,7 @@ from app.services.agent_tools import (
     _get_dingtalk_channel_provisioning_status_tool,
     _google_search_tool,
     _handle_cancel_trigger,
+    _handle_delete_trigger,
     _handle_list_triggers,
     _handle_set_trigger,
     _handle_update_trigger,
@@ -96,6 +97,7 @@ _ROOT_TOOL_SYMBOLS = (
     "_get_dingtalk_channel_provisioning_status_tool",
     "_google_search_tool",
     "_handle_cancel_trigger",
+    "_handle_delete_trigger",
     "_handle_list_triggers",
     "_handle_set_trigger",
     "_handle_update_trigger",
@@ -353,6 +355,12 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
         )
     elif tool_name == "cancel_trigger":
         result = await _handle_cancel_trigger(
+            agent_id,
+            arguments,
+            user_id=user_id,
+        )
+    elif tool_name == "delete_trigger":
+        result = await _handle_delete_trigger(
             agent_id,
             arguments,
             user_id=user_id,

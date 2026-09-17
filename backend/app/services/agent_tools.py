@@ -337,6 +337,7 @@ from app.services.agent_tools_trigger_ops import (
     MAX_TRIGGERS_PER_AGENT,
     VALID_TRIGGER_TYPES,
     _handle_cancel_trigger,
+    _handle_delete_trigger,
     _handle_list_triggers,
     _handle_set_trigger,
     _handle_update_trigger,

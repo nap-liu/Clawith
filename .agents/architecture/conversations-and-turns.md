@@ -71,6 +71,14 @@ running. Occurrence idempotency prevents duplicate dispatch, shared workload
 capacity bounds system load, and workspace locks serialize only conflicting
 mutations rather than the complete model turn.
 
+Trigger cancellation disables the reusable definition. Deletion is a separate
+operation allowed only after the definition is disabled and no execution is
+pending or processing. Deleting the definition releases its name and storage,
+while durable execution rows and conversation history retain the original
+trigger ID and an execution-time name snapshot. Enqueue and deletion serialize
+on the trigger row so deletion cannot create an unclaimable execution. Database
+guards preserve the same contract for older binaries during rolling upgrades.
+
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
 Each startup recovery task acquires the existing conversation execution lease

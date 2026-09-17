@@ -125,12 +125,14 @@ async def test_set_agent_trigger_creates_cron():
 async def test_delete_agent_trigger_removes():
     from app.mcp_server.tools_config import set_agent_trigger_impl, delete_agent_trigger_impl
     from app.models.trigger import AgentTrigger
+    from app.services.agent_tools import _handle_cancel_trigger
     tenant = await _seed_tenant()
     user = await _seed_user(tenant_id=tenant.id)
     agent = await _seed_agent(user)
     token = await _pat(user)
     await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="todelete",
                                  type="cron", config={"expr": "0 9 * * *"}, reason="r")
+    await _handle_cancel_trigger(agent.id, {"name": "todelete"}, user_id=user.id)
     out = await delete_agent_trigger_impl(_ctx(token), agent=str(agent.id), trigger="todelete")
     assert "✅" in out
     async with async_session() as db:

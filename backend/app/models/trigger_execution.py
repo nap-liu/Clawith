@@ -19,8 +19,11 @@ class TriggerExecution(Base):
     __tablename__ = "trigger_executions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    trigger_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agent_triggers.id", ondelete="CASCADE"), nullable=False, index=True
+    # Historical source identifier. Trigger definitions may be deleted after
+    # all admitted executions finish, so this intentionally has no foreign key.
+    trigger_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    trigger_name: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="", server_default=""
     )
     agent_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True

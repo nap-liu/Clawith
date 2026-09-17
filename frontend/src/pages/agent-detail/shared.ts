@@ -16,7 +16,7 @@ export const WORKSPACE_TOOLS = new Set([
     'convert_html_to_pptx',
 ]);
 
-export const AWARE_TOOLS = new Set(['set_trigger', 'update_trigger', 'cancel_trigger', 'list_triggers', 'list_focus_items', 'upsert_focus_item', 'complete_focus_item']);
+export const AWARE_TOOLS = new Set(['set_trigger', 'update_trigger', 'cancel_trigger', 'delete_trigger', 'list_triggers', 'list_focus_items', 'upsert_focus_item', 'complete_focus_item']);
 export const SESSION_PAGE_SIZE = 40;
 export const mergeSessionsById = (first: any[], second: any[]) => {
     const seen = new Set<string>();

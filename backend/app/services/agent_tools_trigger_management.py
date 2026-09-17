@@ -94,6 +94,44 @@ async def _handle_cancel_trigger(agent_id, arguments, *, user_id=None):
     )
 
 
+async def _handle_delete_trigger(agent_id, arguments, *, user_id=None):
+    from app.services.trigger_deletion import TriggerDeletionError, delete_trigger_definition
+
+    try:
+        raw_id = arguments.get("id")
+        trigger_id = uuid.UUID(str(raw_id)) if raw_id else None
+        async with async_session() as db:
+            deleted = await delete_trigger_definition(
+                db,
+                agent_id=agent_id,
+                trigger_id=trigger_id,
+                name=str(arguments.get("name") or "").strip() or None,
+            )
+            await db.commit()
+        from app.services.audit_logger import write_audit_log
+
+        try:
+            await write_audit_log(
+                "trigger_deleted",
+                {"id": str(deleted.id), "name": deleted.name},
+                agent_id=agent_id,
+                user_id=user_id,
+            )
+        except Exception:
+            pass
+        return result_json(
+            {
+                "ok": True,
+                "message": f"✅ Trigger '{deleted.name}' deleted",
+                "deleted_trigger": {"id": str(deleted.id), "name": deleted.name},
+            }
+        )
+    except TriggerDeletionError as exc:
+        return f"❌ Failed to delete trigger: {exc}"
+    except (TypeError, ValueError) as exc:
+        return f"❌ Failed to delete trigger: {exc}"
+
+
 async def _handle_list_triggers(agent_id, arguments=None):
     from app.models.agent import Agent
     from app.core.domain import resolve_base_url

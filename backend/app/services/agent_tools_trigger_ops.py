@@ -21,6 +21,7 @@ from app.services.trigger_time_contract import (
 from app.services.agent_tools_trigger_management import (
     _handle_update_trigger as _handle_update_trigger,
     _handle_cancel_trigger as _handle_cancel_trigger,
+    _handle_delete_trigger as _handle_delete_trigger,
     _handle_list_triggers as _handle_list_triggers,
 )
 

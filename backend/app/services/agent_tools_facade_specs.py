@@ -240,6 +240,7 @@ MAIN_FACADE_SPECS: tuple[FacadeSpec, ...] = (
         async_session logger select ensure_focus_item RecipientResolutionError
         resolve_agent_recipient resolve_platform_user_recipient
         _handle_set_trigger _handle_update_trigger _handle_cancel_trigger
+        _handle_delete_trigger
         _handle_list_triggers
         """,
         sync_exports=False,

@@ -195,7 +195,7 @@ async def list_trigger_executions(
         rows = (
             await db.execute(
                 select(TriggerExecution, AgentTrigger.name)
-                .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
+                .outerjoin(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
                 .where(TriggerExecution.agent_id == agent_id)
                 .order_by(TriggerExecution.scheduled_at.desc())
                 .limit(limit)
@@ -206,7 +206,7 @@ async def list_trigger_executions(
         TriggerExecutionResponse(
             id=str(execution.id),
             trigger_id=str(execution.trigger_id),
-            trigger_name=trigger_name,
+            trigger_name=execution.trigger_name or trigger_name or str(execution.trigger_id),
             source=execution.source,
             status=execution.status,
             conversation_id=str(execution.conversation_id) if execution.conversation_id else None,
@@ -356,22 +356,20 @@ async def delete_trigger(
     trigger_id: uuid.UUID,
     user=Depends(get_current_user),
 ):
-    """Delete a trigger entirely."""
+    """Delete a disabled trigger."""
+    from app.services.trigger_deletion import TriggerDeletionError, delete_trigger_definition
+
     async with async_session() as db:
         await _require_manage(db, user, agent_id)
-        result = await db.execute(
-            select(AgentTrigger).where(
-                AgentTrigger.id == trigger_id,
-                AgentTrigger.agent_id == agent_id,
+        try:
+            deleted = await delete_trigger_definition(
+                db,
+                agent_id=agent_id,
+                trigger_id=trigger_id,
             )
-        )
-        trigger = result.scalar_one_or_none()
-        if not trigger:
-            raise HTTPException(404, "Trigger not found")
-        if trigger.is_system:
-            raise HTTPException(403, "System triggers cannot be deleted")
-
-        await db.delete(trigger)
+        except TriggerDeletionError as exc:
+            status = 404 if exc.code == "not_found" else 403 if exc.code == "system" else 409
+            raise HTTPException(status, str(exc)) from exc
         await db.commit()
 
-    return {"ok": True}
+    return {"ok": True, "deleted_trigger": {"id": str(deleted.id), "name": deleted.name}}
