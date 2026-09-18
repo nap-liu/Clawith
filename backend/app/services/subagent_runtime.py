@@ -14,6 +14,8 @@ from app.services import subagent_runtime_project_dispatch as _project_dispatch
 from app.services import subagent_runtime_project_enqueue as _project_enqueue
 from app.services import subagent_runtime_project_leader as _project_leader
 from app.services import subagent_runtime_shared as _shared
+from app.services import subagent_runtime_status as _status
+from app.services import subagent_runtime_dispatch_supervisor as _dispatch_supervisor
 from app.services import subagent_runtime_tools as _tools
 from app.services import subagent_runtime_worker_claim as _worker_claim
 from app.services import subagent_runtime_worker_execute as _worker_execute
@@ -23,6 +25,8 @@ _EXPORT_MODULES = (
     _shared,
     _lifecycle,
     _tools,
+    _status,
+    _dispatch_supervisor,
     _worker_claim,
     _worker_resume,
     _worker_execute,

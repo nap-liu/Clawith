@@ -56,6 +56,7 @@ from tests.test_subagent_runtime import (
 
 pytestmark = pytest.mark.asyncio
 
+
 async def test_idle_dispatch_repairs_projection_whose_root_is_missing():
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(

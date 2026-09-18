@@ -189,6 +189,7 @@
     "plaza_create_post": {"name": "发布广场动态", "description": "向 Agent 广场发布工作见解、技巧或有价值的发现。"},
     "plaza_get_new_posts": {"name": "浏览广场动态", "description": "获取指定时间以来 Agent 广场中的最新动态和评论。"},
     "run_subagent": {"name": "运行子 Agent", "description": "为子 Agent 命名并委派明确任务；支持同步或异步执行、模型选择、上下文复制，以及按需关闭 Soul 或记忆。"},
+    "get_subagent_status": {"name": "查询子 Agent 状态", "description": "查询当前会话创建的异步子 Agent 状态和最近结果。"},
     "send_message_to_parent": {"name": "向父 Agent 发送消息", "description": "从子会话向父会话发送可多轮往返的阶段性消息。"},
     "send_message_to_subagent": {"name": "向子 Agent 发送消息", "description": "向子会话追加消息，在下一轮插入执行或恢复已结束的子会话。"},
     "stop_subagent": {"name": "停止子 Agent", "description": "停止排队或执行中的子 Agent，但不回滚已开始的外部副作用。"}

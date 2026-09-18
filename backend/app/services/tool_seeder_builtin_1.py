@@ -98,6 +98,27 @@ BUILTIN_TOOLS_PART_1 = [
         "config_schema": {"fields": []},
     },
     {
+        "name": "get_subagent_status",
+        "display_name": "Get Subagent Status",
+        "description": (
+            "Get the current lifecycle state and latest observable result of an async "
+            "Subagent created by this exact parent session."
+        ),
+        "category": "subagent",
+        "icon": "🔎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "subagent_id": {"type": "string", "format": "uuid"},
+            },
+            "required": ["subagent_id"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
         "name": "send_message_to_subagent",
         "display_name": "Message Subagent",
         "description": (

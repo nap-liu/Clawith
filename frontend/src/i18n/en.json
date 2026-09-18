@@ -3419,6 +3419,10 @@
         "name": "Delegate task",
         "description": "Assign a focused task to a Digital Employee and choose how it should be handled."
       },
+      "get_subagent_status": {
+        "name": "Check delegated task",
+        "description": "Check the execution state and latest result of a task delegated by this conversation."
+      },
       "send_message_to_subagent": {
         "name": "Update delegated task",
         "description": "Add requirements or background information to a delegated task."

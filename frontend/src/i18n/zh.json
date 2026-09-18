@@ -3411,6 +3411,10 @@
         "name": "委派协作任务",
         "description": "将目标明确的任务交给数字员工处理，并设置执行方式和所需信息。"
       },
+      "get_subagent_status": {
+        "name": "查询协作任务状态",
+        "description": "查询当前会话委派任务的执行状态和最近结果。"
+      },
       "send_message_to_subagent": {
         "name": "补充协作任务信息",
         "description": "向已委派的协作任务补充要求或背景信息。"

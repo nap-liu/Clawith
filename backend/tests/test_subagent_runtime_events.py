@@ -400,8 +400,8 @@ async def test_idle_parent_batches_multiple_subagent_events_into_one_resume(monk
         [event.id for event in events]
     )
     assert special_events == []
-    assert batches == [[event.id for event in events]]
-    assert await runtime._dispatch_parent_event_batch(batches[0])
+    assert batches == [(parent_id, [event.id for event in events])]
+    assert await runtime._dispatch_parent_event_batch(batches[0][1])
     assert len(resumed) == 1
 
     async with async_session() as db:

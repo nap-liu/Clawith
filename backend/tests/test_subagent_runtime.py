@@ -599,7 +599,7 @@ async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(mon
     assert enabled_names == {"ordinary_tool", "send_message_to_parent"}
 
 
-async def test_subagent_panel_group_toggle_updates_all_four_tools():
+async def test_subagent_panel_group_toggle_updates_all_tools():
     agent_id, user_id, _, _ = await _make_context()
     await seed_builtin_tools()
 
@@ -634,7 +634,7 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
             .scalars()
             .all()
         )
-        assert len(disabled) == 4
+        assert len(disabled) == len(SUBAGENT_TOOL_NAMES)
         assert all(assignment.enabled is False for assignment in disabled)
 
         await update_agent_tools(
@@ -655,7 +655,7 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
             .scalars()
             .all()
         )
-        assert len(enabled) == 4
+        assert len(enabled) == len(SUBAGENT_TOOL_NAMES)
         assert all(assignment.enabled is True for assignment in enabled)
 
 
