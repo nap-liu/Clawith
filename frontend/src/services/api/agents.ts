@@ -192,6 +192,7 @@ export const chatSessionApi = {
       offset?: number;
       cursor?: string;
       exclude_mine?: boolean;
+      query?: string;
       signal?: AbortSignal;
     } = {},
   ) => {
@@ -203,6 +204,7 @@ export const chatSessionApi = {
     if (options.offset != null) params.set("offset", String(options.offset));
     if (options.cursor) params.set("cursor", options.cursor);
     if (options.exclude_mine) params.set("exclude_mine", "true");
+    if (options.query) params.set("query", options.query);
     return request<{
       items: any[];
       has_more: boolean;

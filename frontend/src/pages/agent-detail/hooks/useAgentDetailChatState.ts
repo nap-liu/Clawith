@@ -66,6 +66,8 @@ export function useAgentDetailChatState({
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false);
     const [allSessionsLoadingMore, setAllSessionsLoadingMore] = useState(false);
+    const [sessionSearch, setSessionSearch] = useState('');
+    const [debouncedSessionSearch, setDebouncedSessionSearch] = useState('');
     const [agentExpired, setAgentExpired] = useState(false);
     const token = useAuthStore((s) => s.token);
     const isAgentOwner = currentUser?.id != null && agent?.creator_id != null && String(agent.creator_id) === String(currentUser.id);
@@ -197,6 +199,10 @@ export function useAgentDetailChatState({
     };
     const isViewingOtherUsersSessions = canViewAllAgentChatSessions && chatScope === 'all';
     const othersListForPicker = allSessions;
+    useEffect(() => {
+        const timer = window.setTimeout(() => setDebouncedSessionSearch(sessionSearch.trim()), 300);
+        return () => window.clearTimeout(timer);
+    }, [sessionSearch]);
     useEffect(() => {
         if (!canViewAllAgentChatSessions && chatScope === 'all') setChatScope('mine');
     }, [canViewAllAgentChatSessions, chatScope]);
@@ -461,6 +467,9 @@ export function useAgentDetailChatState({
         setSessionsLoadingMore,
         allSessionsLoadingMore,
         setAllSessionsLoadingMore,
+        sessionSearch,
+        setSessionSearch,
+        debouncedSessionSearch,
         agentExpired,
         setAgentExpired,
         setOnboardingKickoffRequest,

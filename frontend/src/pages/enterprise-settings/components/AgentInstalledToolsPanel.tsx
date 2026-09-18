@@ -1,4 +1,5 @@
 import { IconChevronDown } from '@tabler/icons-react';
+import { useState } from 'react';
 import { getLocalizedToolPresentation } from '../../../utils/toolPresentation';
 import fetchJson from '../api';
 
@@ -11,8 +12,51 @@ export default function AgentInstalledToolsPanel({ model }: { model: any }) {
         loadAgentInstalledTools,
         renderCategoryIcon,
         setExpandedAgentInstalledGroups,
+        switchKnob,
+        switchTrack,
         t,
+        toast,
     } = model;
+    const [updatingGroup, setUpdatingGroup] = useState<string | null>(null);
+    const [deletingGroup, setDeletingGroup] = useState<string | null>(null);
+    const groupActionPending = updatingGroup !== null || deletingGroup !== null;
+
+    const setGroupEnabled = async (groupKey: string, rows: any[], enabled: boolean) => {
+        const agentId = rows[0]?.agent_id;
+        if (!agentId || groupActionPending) return;
+        setUpdatingGroup(groupKey);
+        try {
+            await fetchJson(`/tools/agents/${agentId}`, {
+                method: 'PUT',
+                body: JSON.stringify(rows.map(row => ({ tool_id: row.tool_id, enabled }))),
+            });
+            await loadAgentInstalledTools();
+        } catch (error: any) {
+            toast.error(t('common.error.batchUpdateFailed'), { details: String(error?.message || error) });
+        } finally {
+            setUpdatingGroup(null);
+        }
+    };
+
+    const removeGroup = async (groupKey: string, rows: any[], label: string) => {
+        const agentId = rows[0]?.agent_id;
+        const serverId = rows[0]?.mcp_server_id;
+        if (!agentId || !serverId || groupActionPending) return;
+        const ok = await dialog.confirm(
+            t('enterprise.tools.removeInstalledGroupConfirm', { name: label }),
+            { title: t('agent.tools.deleteMcpGroupTitle'), danger: true, confirmLabel: t('common.delete') },
+        );
+        if (!ok) return;
+        setDeletingGroup(groupKey);
+        try {
+            await fetchJson(`/tools/agents/${agentId}/mcp-servers/${serverId}`, { method: 'DELETE' });
+            await loadAgentInstalledTools();
+        } catch (error: any) {
+            toast.error(t('agent.tools.deleteFailed'), { details: String(error?.message || error) });
+        } finally {
+            setDeletingGroup(null);
+        }
+    };
 
     return (
                             <div>
@@ -22,7 +66,7 @@ export default function AgentInstalledToolsPanel({ model }: { model: any }) {
                                 ) : (
                                     (() => {
                                         const grouped = agentInstalledTools.reduce((acc: Record<string, any[]>, row: any) => {
-                                            const groupKey = getLocalizedToolPresentation(t, row).groupKey;
+                                            const groupKey = `${getLocalizedToolPresentation(t, row).groupKey}:agent:${row.agent_id}`;
                                             (acc[groupKey] = acc[groupKey] || []).push(row);
                                             return acc;
                                         }, {});
@@ -46,13 +90,21 @@ export default function AgentInstalledToolsPanel({ model }: { model: any }) {
                                                         const groupRows = rows as any[];
                                                         const meta = getToolGroupMeta(groupKey, groupRows);
                                                         const expanded = expandedAgentInstalledGroups.has(groupKey);
+                                                        const installedByNames = [...new Set(groupRows.map((row: any) => (
+                                                            row.installed_by_agent_name || t('enterprise.tools.unknownDigitalEmployee')
+                                                        )))];
+                                                        const enabledCount = groupRows.filter((row: any) => row.enabled).length;
+                                                        const allEnabled = enabledCount === groupRows.length;
+                                                        const mixedEnabled = enabledCount > 0 && !allEnabled;
                                                         return (
                                                             <div key={groupKey} style={{ border: '1px solid var(--border-subtle)', borderRadius: '8px', overflow: 'hidden', background: 'var(--bg-primary)' }}>
                                                                 <div
                                                                     role="button"
                                                                     tabIndex={0}
+                                                                    aria-expanded={expanded}
                                                                     onClick={() => toggleAgentInstalledGroup(groupKey)}
                                                                     onKeyDown={(e) => {
+                                                                        if (e.target !== e.currentTarget) return;
                                                                         if (e.key === 'Enter' || e.key === ' ') {
                                                                             e.preventDefault();
                                                                             toggleAgentInstalledGroup(groupKey);
@@ -70,6 +122,29 @@ export default function AgentInstalledToolsPanel({ model }: { model: any }) {
                                                                             </span>
                                                                         </div>
                                                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{meta.description}</div>
+                                                                        <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '3px' }}>{t('enterprise.tools.installedByDigitalEmployees', { names: installedByNames.join(', ') })}</div>
+                                                                    </div>
+                                                                    <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }} onClick={(event) => event.stopPropagation()}>
+                                                                        <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: groupActionPending ? 'wait' : 'pointer', opacity: groupActionPending ? 0.6 : 1 }}>
+                                                                            <input
+                                                                                type="checkbox"
+                                                                                checked={allEnabled}
+                                                                                aria-checked={mixedEnabled ? 'mixed' : allEnabled}
+                                                                                disabled={groupActionPending}
+                                                                                onChange={(event) => void setGroupEnabled(groupKey, groupRows, event.target.checked)}
+                                                                                aria-label={t('enterprise.tools.toggleInstalledGroup', { name: meta.label })}
+                                                                                style={{ opacity: 0, width: 0, height: 0 }}
+                                                                            />
+                                                                            <span style={switchTrack(allEnabled, mixedEnabled)}><span style={switchKnob(allEnabled)} /></span>
+                                                                        </label>
+                                                                        <button
+                                                                            type="button"
+                                                                            className="btn btn-danger"
+                                                                            disabled={!groupRows[0]?.mcp_server_id || groupActionPending}
+                                                                            title={!groupRows[0]?.mcp_server_id ? t('enterprise.tools.legacyGroupDeleteUnavailable') : undefined}
+                                                                            onClick={() => void removeGroup(groupKey, groupRows, meta.label)}
+                                                                            style={{ padding: '4px 8px', fontSize: '11px' }}
+                                                                        >{deletingGroup === groupKey ? t('common.loading') : t('enterprise.tools.deleteGroup')}</button>
                                                                     </div>
                                                                 </div>
                                                                 {expanded && groupRows.map((row: any, idx: number) => {

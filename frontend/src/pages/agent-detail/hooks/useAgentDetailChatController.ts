@@ -104,9 +104,13 @@ export function useAgentDetailChatController({
         helpers,
     });
 
+    const onAdminTabMine = () => {
+        chat.onAdminTabMine();
+        void sessionSelection.fetchMySessions();
+    };
     const onAdminTabOthers = () => {
         chat.onAdminTabOthers();
-        if (chat.allSessions.length === 0) void sessionSelection.fetchAllSessions();
+        void sessionSelection.fetchAllSessions();
     };
 
     return {
@@ -114,6 +118,7 @@ export function useAgentDetailChatController({
         ...sessionSelection,
         ...socketMessages,
         ...resumeComposer,
+        onAdminTabMine,
         onAdminTabOthers,
     };
 }
