@@ -106,7 +106,11 @@ async def _send_verification_email_task(
             logger.warning(f"No identity found for user {user.id} ({user.email}). Cannot send verification.")
             return
 
-        raw_code, expires_at = await email_verification_service.create_email_verification_token(identity.id, identity.email)
+        raw_code, expires_at = await email_verification_service.create_email_verification_token(
+            identity.id,
+            identity.email,
+            user_id=user.id,
+        )
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
 
         background_tasks.add_task(

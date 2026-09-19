@@ -104,6 +104,9 @@ class User(Base):
     source: Mapped[str | None] = mapped_column(String(50), default="web", index=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Explicit tenant-level login suspension. ``is_active`` is provider-derived
+    # and may be recomputed; automated flows never clear this administrator flag.
+    is_login_suspended: Mapped[bool] = mapped_column(Boolean, default=False)
 
     registration_source: Mapped[str | None] = mapped_column(String(50), default="web")
 

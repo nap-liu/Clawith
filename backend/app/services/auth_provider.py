@@ -152,14 +152,6 @@ class BaseAuthProvider(ABC):
             candidate = result.scalar_one_or_none()
             if candidate:
                 user = candidate
-                await sso_service.link_identity(
-                    db,
-                    str(user.id),
-                    self.provider_type,
-                    user_info.provider_user_id,
-                    user_info.raw_data,
-                    tenant_id=tenant_id,
-                )
                 logger.info(f"[SSO] Matched existing user by username: {user.username} (tenant_id={tenant_id})")
 
 
@@ -199,6 +191,7 @@ class BaseAuthProvider(ABC):
             provider_user_id,
             user_info.raw_data,
             tenant_id=tenant_id,
+            authenticated=True,
         )
 
         # SSO users should also appear as Web members for tenant-side user management.
@@ -247,8 +240,6 @@ class BaseAuthProvider(ABC):
                     subject=oauth_subject,
                 )
                 if trusted_user is not None:
-                    if not trusted_user.is_active:
-                        raise HTTPException(status_code=403, detail="Account is disabled")
                     # Validate the claim before any profile or projection write.
                     normalize_oauth_email(user_info.email)
                     trusted_user, _ = await oauth_identity_service.refresh_authoritative_contacts(
@@ -268,6 +259,7 @@ class BaseAuthProvider(ABC):
                         user_info.raw_data,
                         tenant_id=str(tenant_uuid),
                         provider_model=exact_provider_model,
+                        authenticated=True,
                     )
                     await self._update_existing_user(
                         db, trusted_user, user_info, refresh_contacts=False
@@ -281,11 +273,6 @@ class BaseAuthProvider(ABC):
                 user_info=user_info,
             )
             if repaired_user is not None:
-                if not repaired_user.is_active:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="User account is disabled",
-                    )
                 await sso_service.link_identity(
                     db,
                     str(repaired_user.id),
@@ -294,6 +281,7 @@ class BaseAuthProvider(ABC):
                     user_info.raw_data,
                     tenant_id=str(tenant_uuid),
                     provider_model=exact_provider_model,
+                    authenticated=True,
                 )
                 await registration_service.ensure_web_org_member(db, repaired_user)
                 if oauth_subject is not None:
@@ -315,10 +303,6 @@ class BaseAuthProvider(ABC):
                 provider_model=exact_provider_model,
             )
             if exact_user is not None:
-                if not exact_user.is_active:
-                    raise HTTPException(
-                        status_code=403, detail="User account is disabled"
-                    )
                 exact_member = await sso_service.link_identity(
                     db,
                     str(exact_user.id),
@@ -327,6 +311,7 @@ class BaseAuthProvider(ABC):
                     user_info.raw_data,
                     tenant_id=str(tenant_uuid),
                     provider_model=exact_provider_model,
+                    authenticated=True,
                 )
                 await self._update_existing_user(
                     db,
@@ -379,9 +364,6 @@ class BaseAuthProvider(ABC):
                     avatar_url=user_info.avatar_url or None,
                     registration_source=self.provider_type,
                 )
-            if not user.is_active:
-                raise HTTPException(status_code=403, detail="User account is disabled")
-
             # Re-load after a possible SQL-level convergence, then update only
             # non-identity profile fields. Identity claims were already checked
             # together by find_or_create_identity.
@@ -402,6 +384,7 @@ class BaseAuthProvider(ABC):
                 user_info.raw_data,
                 tenant_id=str(tenant_uuid),
                 provider_model=exact_provider_model,
+                authenticated=True,
             )
             await registration_service.ensure_web_org_member(db, user)
             if oauth_subject is not None:

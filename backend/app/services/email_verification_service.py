@@ -23,7 +23,13 @@ class EmailVerificationService:
         import hashlib
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    async def create_email_verification_token(self, identity_id: uuid.UUID, email: str) -> tuple[str, datetime]:
+    async def create_email_verification_token(
+        self,
+        identity_id: uuid.UUID,
+        email: str,
+        *,
+        user_id: uuid.UUID | None = None,
+    ) -> tuple[str, datetime]:
         """Create a new 6-digit email verification code and store in Redis."""
         redis = await get_redis()
         user_key = f"{USER_PREFIX}{identity_id}"
@@ -48,7 +54,11 @@ class EmailVerificationService:
 
         # Store as JSON with identity_id and email
         import json
-        token_data = json.dumps({"identity_id": str(identity_id), "email": email})
+        token_data = json.dumps({
+            "identity_id": str(identity_id),
+            "email": email,
+            "user_id": str(user_id) if user_id else None,
+        })
 
         async with redis.pipeline(transaction=True) as pipe:
             pipe.setex(token_key, ttl_seconds, token_data)
@@ -78,6 +88,7 @@ class EmailVerificationService:
             token_data = json.loads(token_data_str)
             identity_id = uuid.UUID(token_data["identity_id"])
             email = token_data["email"]
+            user_id = uuid.UUID(token_data["user_id"]) if token_data.get("user_id") else None
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
 
@@ -89,7 +100,7 @@ class EmailVerificationService:
             pipe.delete(user_key)
             await pipe.execute()
 
-        return {"identity_id": identity_id, "email": email}
+        return {"identity_id": identity_id, "email": email, "user_id": user_id}
 
     async def send_verification_email(
         self,

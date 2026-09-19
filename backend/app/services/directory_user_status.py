@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import distinct, select
+from sqlalchemy import distinct, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
@@ -38,6 +38,22 @@ async def sync_tenant_user_statuses(
     if not affected_user_ids:
         return {"enabled": 0, "disabled": 0}
 
+    # Every writer of the derived User flag takes these locks.  This makes a
+    # concurrent login and directory sync resolve in commit order without a
+    # second state machine or provider-specific coordination.
+    users = (
+        await db.scalars(
+            select(User)
+            .where(
+                User.tenant_id == tenant_id,
+                User.id.in_(affected_user_ids),
+            )
+            .order_by(User.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+
     active_user_ids = set(
         (
             await db.scalars(
@@ -47,23 +63,21 @@ async def sync_tenant_user_statuses(
                     OrgMember.tenant_id == tenant_id,
                     OrgMember.user_id.in_(affected_user_ids),
                     OrgMember.status == "active",
-                    IdentityProvider.tenant_id == tenant_id,
+                    or_(
+                        IdentityProvider.tenant_id == tenant_id,
+                        IdentityProvider.tenant_id.is_(None),
+                    ),
                     IdentityProvider.is_active.is_(True),
                 )
             )
         ).all()
     )
-    users = (
-        await db.scalars(
-            select(User).where(
-                User.tenant_id == tenant_id,
-                User.id.in_(affected_user_ids),
-            )
-        )
-    ).all()
     changed = {"enabled": 0, "disabled": 0}
     for user in users:
-        next_active = user.id in active_user_ids
+        # Keep the legacy projection fail-closed as well.  This preserves an
+        # administrator suspension if an emergency rollback runs an older
+        # binary that only understands User.is_active.
+        next_active = user.id in active_user_ids and not user.is_login_suspended
         if user.is_active == next_active:
             continue
         user.is_active = next_active
