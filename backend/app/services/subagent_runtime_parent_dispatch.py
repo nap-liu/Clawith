@@ -176,7 +176,10 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
 
 async def _pending_parent_event_groups(
     message_ids: list[uuid.UUID],
-) -> tuple[list[list[uuid.UUID]], list[uuid.UUID]]:
+) -> tuple[
+    list[tuple[uuid.UUID, list[uuid.UUID]]],
+    list[tuple[uuid.UUID, uuid.UUID]],
+]:
     """Split ordinary parent batches from project-specific single events."""
     if not message_ids:
         return [], []
@@ -205,17 +208,26 @@ async def _pending_parent_event_groups(
             )
         ).all()
     batches: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], list[uuid.UUID]] = {}
-    special: list[uuid.UUID] = []
+    special: list[tuple[uuid.UUID, uuid.UUID]] = []
     grouped_ids: set[uuid.UUID] = set()
     for message_id, parent_id, execution_user_id, execution_agent_id, project_id, source_channel in rows:
         grouped_ids.add(message_id)
         if project_id is not None or source_channel == SUBAGENT_CHANNEL:
-            special.append(message_id)
+            special.append((parent_id, message_id))
             continue
         key = (parent_id, execution_user_id, execution_agent_id)
         batches.setdefault(key, []).append(message_id)
-    special.extend(message_id for message_id in message_ids if message_id not in grouped_ids)
-    return list(batches.values()), special
+    # Rows without a complete parent/run join are handled by the compatibility
+    # dispatcher under a per-event surrogate key; it will discard them safely.
+    special.extend(
+        (message_id, message_id)
+        for message_id in message_ids
+        if message_id not in grouped_ids
+    )
+    return [
+        (parent_id, batch)
+        for (parent_id, _user_id, _agent_id), batch in batches.items()
+    ], special
 
 
 async def _persist_parent_batch_identity_failure(

@@ -163,6 +163,7 @@ async def execute_tool_preflight(
 
     if tool_name in {
         "run_subagent",
+        "get_subagent_status",
         "send_message_to_subagent",
         "stop_subagent",
         "send_message_to_parent",
@@ -171,6 +172,7 @@ async def execute_tool_preflight(
             SubagentError,
             append_subagent_message,
             create_subagent,
+            get_subagent_status,
             run_subagent_sync,
             send_subagent_message_to_parent,
             stop_subagent,
@@ -245,6 +247,14 @@ async def execute_tool_preflight(
                     origin_tool_call_id=tool_call_id,
                 )
                 return json.dumps({"status": status}, ensure_ascii=False)
+            if tool_name == "get_subagent_status":
+                status = await get_subagent_status(
+                    agent_id=agent_id,
+                    parent_session_id=session_id,
+                    subagent_id=arguments.get("subagent_id"),
+                    execution_user_id=user_id,
+                )
+                return json.dumps(status, ensure_ascii=False)
             if tool_name == "stop_subagent":
                 status = await stop_subagent(
                     agent_id=agent_id,

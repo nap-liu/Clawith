@@ -30,6 +30,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "read_media",
     "update_self_settings",
     "run_subagent",
+    "get_subagent_status",
     "send_message_to_subagent",
     "stop_subagent",
     "send_message_to_parent",

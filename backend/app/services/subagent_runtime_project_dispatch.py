@@ -567,7 +567,11 @@ async def _recover_project_dispatch_outbox_once() -> bool:
         await asyncio.sleep(0)
 
 
-async def _dispatch_event_loop(*, project_scope: bool) -> None:
+async def _dispatch_event_loop_forever(
+    *,
+    project_scope: bool,
+    supervisor,
+) -> None:
     startup_pass = True
     legacy_backlog = True
     loop = asyncio.get_running_loop()
@@ -613,6 +617,7 @@ async def _dispatch_event_loop(*, project_scope: bool) -> None:
                 project_scope=project_scope,
                 legacy_count_out=legacy_counts,
                 legacy_ids_out=legacy_ids,
+                exclude_ids=supervisor.active_message_ids(),
             )
         except asyncio.CancelledError:
             raise
@@ -632,40 +637,26 @@ async def _dispatch_event_loop(*, project_scope: bool) -> None:
             wake_event.set()
             await asyncio.sleep(1)
             continue
-        for message_ids in parent_batches:
-            try:
-                processed = await _dispatch_parent_event_batch(message_ids)
-                made_progress = processed or made_progress
-                if not processed:
-                    legacy_retry_needed = legacy_retry_needed or bool(
-                        legacy_ids.intersection(message_ids)
-                    )
-                    loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - isolate each durable event
-                logger.exception(
-                    f"[subagent] parent event batch dispatch failed messages={message_ids}: {exc}"
-                )
+        for parent_session_id, message_ids in parent_batches:
+            scheduled = supervisor.schedule(
+                parent_session_id=parent_session_id,
+                message_ids=message_ids,
+                work=lambda ids=list(message_ids): _dispatch_parent_event_batch(ids),
+            )
+            made_progress = scheduled or made_progress
+            if not scheduled:
                 legacy_retry_needed = legacy_retry_needed or bool(
                     legacy_ids.intersection(message_ids)
                 )
-                loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
-        for message_id in special_events:
-            try:
-                processed = await _dispatch_parent_event(message_id)
-                made_progress = processed or made_progress
-                if not processed:
-                    legacy_retry_needed = (
-                        legacy_retry_needed or message_id in legacy_ids
-                    )
-                    loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - isolate each durable event
-                logger.exception(f"[subagent] parent event dispatch failed message={message_id}: {exc}")
+        for parent_session_id, message_id in special_events:
+            scheduled = supervisor.schedule(
+                parent_session_id=parent_session_id,
+                message_ids=[message_id],
+                work=lambda event_id=message_id: _dispatch_parent_event(event_id),
+            )
+            made_progress = scheduled or made_progress
+            if not scheduled:
                 legacy_retry_needed = legacy_retry_needed or message_id in legacy_ids
-                loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
         leader_groups: list[uuid.UUID] = []
         if project_scope:
             try:
@@ -724,6 +715,26 @@ async def _dispatch_event_loop(*, project_scope: bool) -> None:
                 next_recovery_at = loop.time() + DISPATCH_RECOVERY_INTERVAL_SECONDS
         elif recovery_pass:
             next_recovery_at = loop.time() + DISPATCH_RECOVERY_INTERVAL_SECONDS
+
+
+async def _dispatch_event_loop(*, project_scope: bool) -> None:
+    from app.services.subagent_runtime_dispatch_supervisor import (
+        ParentDispatchSupervisor,
+    )
+
+    wake_event = _project_dispatch_wakeup if project_scope else _dispatch_wakeup
+    supervisor = ParentDispatchSupervisor(
+        concurrency=PARENT_EVENT_DISPATCH_CONCURRENCY,
+        retry_seconds=DISPATCH_RETRY_INTERVAL_SECONDS,
+        wake_event=wake_event,
+    )
+    try:
+        await _dispatch_event_loop_forever(
+            project_scope=project_scope,
+            supervisor=supervisor,
+        )
+    finally:
+        await supervisor.close()
 
 
 async def _subagent_parent_dispatch_loop() -> None:

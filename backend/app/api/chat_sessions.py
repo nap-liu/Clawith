@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import datetime
 from datetime import timezone as tz
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
@@ -56,6 +56,7 @@ from app.api.chat_session_models import (
     SessionPageOut,
     SessionRuntimeOut,
 )
+from app.api.chat_session_search import session_name_search
 import app.api.chat_session_access as _chat_session_access
 import app.api.chat_session_message_query as _chat_session_message_query
 
@@ -155,11 +156,11 @@ async def list_sessions(
     cursor: Optional[str] = None,
     paginated: bool = False,
     exclude_mine: bool = False,
+    query: Annotated[str, Query(max_length=100)] = "",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List chat sessions for an agent. scope=all for org/platform admins and agent_admin."""
-    # Verify agent exists
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = agent_result.scalar_one_or_none()
     if not agent:
@@ -167,6 +168,7 @@ async def list_sessions(
     _, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     source_channel = (source_channel or "").strip() or None
+    query_text = query.strip()
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
     use_cursor_pagination = paginated and (cursor is not None or offset == 0)
@@ -191,16 +193,12 @@ async def list_sessions(
         if not _can_view_all_agent_chat_sessions(current_user, agent, agent_access):
             raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
-        # Fetch all sessions (including agent-to-agent where this agent is peer)
         all_where = (
             (
                 (ChatSession.agent_id == agent_id)
                 | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
             )
             & (ChatSession.source_channel != "subagent")
-            # Project conversations have their own project-scoped navigation
-            # and APIs.  Never leak planning, group, or direct project A2A
-            # threads into the ordinary Web Agent session picker.
             & ChatSession.project_id.is_(None)
         )
         has_messages = (
@@ -228,6 +226,8 @@ async def list_sessions(
             )
         if source_channel:
             query = query.where(ChatSession.source_channel == source_channel)
+        if search_query := query_text:
+            query = query.where(session_name_search(search_query))
         cursor_created_at = None
         cursor_session_id = None
         if use_cursor_pagination and cursor:
@@ -402,6 +402,8 @@ async def list_sessions(
         )
         if source_channel:
             query = query.where(ChatSession.source_channel == source_channel)
+        if search_query := query_text:
+            query = query.where(session_name_search(search_query))
         primary_id = None
         cursor_anchor = None
         if use_cursor_pagination:

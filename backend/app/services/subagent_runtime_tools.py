@@ -96,6 +96,7 @@ async def prepare_subagent_tools(
 
     hidden = {
         "run_subagent",
+        "get_subagent_status",
         "send_message_to_subagent",
         "stop_subagent",
         "send_message_to_parent",
