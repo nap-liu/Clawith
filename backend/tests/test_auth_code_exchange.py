@@ -629,3 +629,129 @@ async def test_auth_code_exchange_binds_user_to_provider_tenant(monkeypatch):
             )
         ).scalar_one()
         assert user.tenant_id == tenant_id
+
+
+@pytest.mark.parametrize(
+    ("stale_provider_type", "stale_status"),
+    [
+        ("dingtalk", "deleted"),
+        ("feishu", "inactive"),
+        ("wecom", "deleted"),
+        ("scim", "inactive"),
+    ],
+)
+async def test_h5_fresh_source_reactivates_user_without_restoring_stale_source(
+    monkeypatch,
+    stale_provider_type,
+    stale_status,
+):
+    suffix = uuid.uuid4().hex[:8]
+    phone = f"137{uuid.uuid4().int % 10**8:08d}"
+    subject = f"reactivate-{suffix}"
+    async with async_session() as db:
+        tenant = Tenant(name="H5 Reactivation", slug=f"h5-reactivate-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        oauth_provider = IdentityProvider(
+            provider_type="oauth2",
+            name="H5 Login",
+            tenant_id=tenant.id,
+            is_active=True,
+            sso_login_enabled=True,
+            config={
+                "provider_key": f"h5-reactivate-{suffix}",
+                "app_id": "client",
+                "app_secret": "secret",
+                "token_url": "https://reactivate.example.com/token",
+                "user_info_url": "https://reactivate.example.com/userinfo",
+                "field_mapping": {"user_id": "id", "name": "name", "mobile": "phone"},
+                "allowed_purposes": ["h5_agent_chat"],
+                "allowed_redirect_hosts": ["app.example.com"],
+                "allowed_redirect_paths": ["/h5/agents/*/chat"],
+            },
+        )
+        stale_provider = IdentityProvider(
+            provider_type=stale_provider_type,
+            name=f"Stale {stale_provider_type}",
+            tenant_id=tenant.id,
+            is_active=True,
+            sso_login_enabled=False,
+            config={},
+        )
+        identity = Identity(phone=phone, username=f"reactivate-{suffix}", email_verified=True)
+        db.add_all([oauth_provider, stale_provider, identity])
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name="Reactivated User",
+            role="member",
+            is_active=False,
+        )
+        db.add(user)
+        await db.flush()
+        stale_member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=stale_provider.id,
+            external_id=f"staff-{suffix}",
+            name="Reactivated User",
+            phone=phone,
+            user_id=user.id,
+            status=stale_status,
+        )
+        previous_oauth_member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=oauth_provider.id,
+            external_id=f"previous-{subject}",
+            name="Previous OAuth Subject",
+            user_id=user.id,
+            status="deleted",
+        )
+        db.add_all([stale_member, previous_oauth_member])
+        await db.commit()
+        user_id = user.id
+        stale_member_id = stale_member.id
+        previous_oauth_member_id = previous_oauth_member.id
+        provider_key = oauth_provider.config["provider_key"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://reactivate.example.com/token":
+            return httpx.Response(200, json={"access_token": "AT-REACTIVATE"})
+        if str(request.url) == "https://reactivate.example.com/userinfo":
+            return httpx.Response(200, json={"id": subject, "name": "Reactivated User", "phone": phone})
+        return httpx.Response(404)
+
+    class _PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr("app.services.auth_provider.httpx.AsyncClient", _PatchedAsyncClient)
+    transport = httpx.ASGITransport(app=app)
+    async with real_client(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/auth/code/exchange",
+            json={
+                "provider": provider_key,
+                "code": "CODE-REACTIVATE",
+                "purpose": "h5_agent_chat",
+                "channel": "miniprogram",
+                "redirect_uri": "https://app.example.com/h5/agents/a1/chat",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    async with async_session() as db:
+        user = await db.get(User, user_id)
+        stale_member = await db.get(OrgMember, stale_member_id)
+        previous_oauth_member = await db.get(OrgMember, previous_oauth_member_id)
+        oauth_member = await db.scalar(
+            select(OrgMember).where(
+                OrgMember.user_id == user_id,
+                OrgMember.external_id == subject,
+            )
+        )
+        assert user is not None and user.is_active is True
+        assert stale_member is not None and stale_member.status == stale_status
+        assert previous_oauth_member is not None and previous_oauth_member.status == "deleted"
+        assert oauth_member is not None and oauth_member.status == "active"

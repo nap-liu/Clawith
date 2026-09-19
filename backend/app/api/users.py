@@ -369,7 +369,14 @@ async def update_user_profile(
         if target.identity:
             target.identity.phone = data.primary_mobile.strip() or None
     if data.is_active is not None:
+        target.is_login_suspended = not data.is_active
         target.is_active = data.is_active
+        if data.is_active:
+            from app.services.authentication_principal import (
+                activate_platform_admin_source,
+            )
+
+            await activate_platform_admin_source(db, user=target)
     if data.new_password is not None and data.new_password.strip():
         from app.core.security import hash_password
         if len(data.new_password.strip()) < 6:

@@ -45,7 +45,7 @@ class SSOService:
             .join(User.identity)
             .where(
                 Identity.email == email,
-                User.is_active == True,
+                User.is_active.is_(True),
             )
             .options(selectinload(User.identity))
         )
@@ -71,7 +71,7 @@ class SSOService:
                     select(User)
                     .where(
                         User.identity_id == identity.id,
-                        User.is_active == True,
+                        User.is_active.is_(True),
                     )
                     .options(selectinload(User.identity))
                     .limit(1)
@@ -128,7 +128,7 @@ class SSOService:
                 select(User)
                 .where(
                     User.identity_id == identity.id,
-                    User.is_active == True,
+                    User.is_active.is_(True),
                 )
                 .options(selectinload(User.identity))
                 .limit(1)
@@ -325,6 +325,7 @@ class SSOService:
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
         tenant_id: str | uuid.UUID | None = None,
+        include_inactive: bool = False,
     ):
         from app.models.org import OrgMember
 
@@ -332,9 +333,10 @@ class SSOService:
             column = getattr(OrgMember, field)
             query = select(OrgMember).where(
                 OrgMember.provider_id == provider_id,
-                OrgMember.status == "active",
                 column == lookup_value,
             )
+            if not include_inactive:
+                query = query.where(OrgMember.status == "active")
             if tenant_id is not None:
                 query = query.where(OrgMember.tenant_id == tenant_id)
             member_result = await db.execute(query)
@@ -360,6 +362,7 @@ class SSOService:
         tenant_id: str | None = None,
         *,
         provider_model: IdentityProvider | None = None,
+        authenticated: bool = False,
     ) -> Any:
         """Link an external identity to an existing user via OrgMember.
 
@@ -407,9 +410,10 @@ class SSOService:
             provider_user_id,
             identity_data,
             tenant_id=tenant_id,
+            include_inactive=authenticated,
         )
 
-        if not member:
+        if not member and not authenticated:
             # Reuse any OrgMember already owned by this user under this provider, even when
             # _find_identity_member misses (e.g. oauth2 providers whose payloads carry no
             # external_id/open_id/unionid → lookup chain has nothing to match on). Without
@@ -418,11 +422,11 @@ class SSOService:
                 select(OrgMember).where(
                     OrgMember.provider_id == provider.id,
                     OrgMember.user_id == uid,
-                    OrgMember.status == "active",
                 )
                 .order_by(OrgMember.synced_at)
                 .limit(1)
             )
+            fallback_query = fallback_query.where(OrgMember.status == "active")
             if tenant_id is not None:
                 fallback_query = fallback_query.where(OrgMember.tenant_id == tenant_id)
             fallback_result = await db.execute(fallback_query)
@@ -516,6 +520,21 @@ class SSOService:
             db.add(member)
         
         await db.flush()
+        if authenticated:
+            from app.services.authentication_principal import (
+                activate_authenticated_source,
+            )
+
+            user = await db.get(User, uid)
+            if user is None:
+                raise ValueError("Authenticated user no longer exists")
+            await activate_authenticated_source(
+                db,
+                user=user,
+                provider=provider,
+                member=member,
+                method=str(provider_type),
+            )
         return member
 
     async def unlink_identity(

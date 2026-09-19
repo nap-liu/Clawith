@@ -57,18 +57,12 @@ async def login(
 
     if not identity.email_verified:
         from app.config import get_settings
-        from sqlalchemy import update
         from app.services.system_email_service import resolve_email_config_async
 
         email_config = await resolve_email_config_async(db)
         if not email_config:
             identity.email_verified = True
             identity.is_active = True
-            await db.execute(
-                update(User)
-                .where(User.identity_id == identity.id)
-                .values(is_active=True)
-            )
             await db.flush()
         else:
             # Find any user record (just for the task)
@@ -95,7 +89,7 @@ async def login(
         .outerjoin(Tenant, Tenant.id == User.tenant_id)
         .where(
             User.identity_id == identity.id,
-            User.is_active.is_(True),
+            User.is_login_suspended.is_(False),
             or_(User.tenant_id.is_(None), Tenant.is_active.is_(True)),
         )
         .options(selectinload(User.identity))
@@ -157,6 +151,12 @@ async def login(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="This account does not belong to the selected organization.",
             )
+
+    from app.services.authentication_principal import (
+        activate_platform_password_source,
+    )
+
+    user = await activate_platform_password_source(db, user=user)
 
 
     if user.tenant_id:

@@ -75,6 +75,13 @@ Tenant
   active 来源时才停用。该聚合必须与 provider 同步顺序无关，且不得修改其他租户或
   `PlatformUser.is_active`；
 - provider、tenant 或来源账号 inactive 时，统一授权取相关状态的交集。
+- `TenantUserMembership.is_login_suspended` 表示租户管理员明确暂停登录，独立于
+  来源账号聚合结果；目录同步和登录归一不得清除此状态。所有登录入口共享同一认证
+  主体编排：已有会话、委托凭据和临时登录链接只执行只读门禁；只有通过完整凭据校验
+  的密码登录或新鲜可信 provider 登录，才可把当前精确来源账号标记为 active，再按
+  全部启用 provider 的来源状态重算 `TenantUserMembership.is_active`。新来源恢复不得
+  修改其他 provider 的 deleted/inactive 事实，也不得绕过 PlatformUser、tenant 或
+  `is_login_suspended` 的停用状态。
 - 已验证签名的 provider 入站事件若同时通过 provider 用户详情接口确认该账号仍存在，
   这是比旧同步快照更新的 active 事实；共享解析器必须先恢复该 DirectoryAccount 和
   当前 tenant membership，再执行绑定校验。详情接口失败不得被解释为 active，也不得

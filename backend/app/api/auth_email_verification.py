@@ -41,43 +41,38 @@ async def verify_email(
         raise HTTPException(status_code=400, detail="Identity not found")
 
     identity.email_verified = True
-    identity.is_active = True
-
-    # 2. Activate all linked User accounts
-    # email_verified is a proxy to Identity, so only update physical is_active column
-    from sqlalchemy import update
-    await db.execute(
-        update(User)
-        .where(User.identity_id == identity.id)
-        .values(is_active=True)
-    )
 
     await db.flush()
-    await db.commit()
+    token_user_id = token_data.get("user_id")
+    user = await db.get(User, token_user_id) if token_user_id else None
+    if user is None and token_user_id is None:
+        legacy_users = list(
+            (
+                await db.scalars(
+                    select(User).where(User.identity_id == identity.id).limit(2)
+                )
+            ).all()
+        )
+        user = legacy_users[0] if len(legacy_users) == 1 else None
+    if user is None or user.identity_id != identity.id:
+        raise HTTPException(status_code=400, detail="Verification token has no login membership")
+    from app.services.authentication_principal import activate_platform_email_source
 
-    # Refresh after commit to avoid MissingGreenlet during Pydantic validation
+    user = await activate_platform_email_source(db, user=user)
+    await db.commit()
     await db.refresh(identity)
 
-    # 3. Find a representative user for the token (for immediate login)
-    user_result = await db.execute(
-        select(User)
-        .where(User.identity_id == identity.id)
-        .order_by(User.created_at.desc())
-        .limit(1)
-    )
-    user = user_result.scalar_one_or_none()
-
     # 4. Generate token and return full response for Auto Login (TokenResponse)
-    effective_id = str(user.id) if user else str(identity.id)
-    effective_role = user.role if user else "user"
+    effective_id = str(user.id)
+    effective_role = user.role
     token = create_access_token(effective_id, effective_role)
     set_access_token_cookie(response, request, token)
 
     return TokenResponse(
         access_token=token,
-        user=UserOut.model_validate(user) if user else None,
+        user=UserOut.model_validate(user),
         identity=IdentityOut.model_validate(identity),
-        needs_company_setup=user.tenant_id is None if user else True,
+        needs_company_setup=user.tenant_id is None,
     )
 
 

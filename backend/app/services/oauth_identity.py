@@ -238,8 +238,11 @@ class OAuthIdentityService:
         self.validate_enterprise_provider(provider, tenant_id)
         normalized_subject = normalize_oauth_subject(subject)
         normalized_email = normalize_oauth_email(email)
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account is disabled")
+        from app.services.authentication_state import (
+            require_reactivatable_authentication_principal,
+        )
+
+        await require_reactivatable_authentication_principal(db, user)
 
         bound_user = await self.resolve_bound_user(
             db,
@@ -319,7 +322,6 @@ class OAuthIdentityService:
                         "tenant_id": str(tenant_id),
                         "provider_id": str(provider.id),
                         "identity_id": str(locked_user.identity_id),
-                        "subject_sha256": hashlib.sha256(normalized_subject.encode()).hexdigest(),
                         "old_email": old_email,
                         "new_email": normalized_email,
                         "old_email_verified": old_verified,
@@ -336,7 +338,6 @@ class OAuthIdentityService:
                         "tenant_id": str(tenant_id),
                         "provider_id": str(provider.id),
                         "identity_id": str(locked_user.identity_id),
-                        "subject_sha256": hashlib.sha256(normalized_subject.encode()).hexdigest(),
                         "old_phone": old_phone,
                         "new_phone": normalize_phone(phone),
                     },
