@@ -62,6 +62,7 @@ export function useAgentDetailSessionSelection({
         allSessionsListAbortRef,
         sessionsListGenerationRef,
         allSessionsListGenerationRef,
+        debouncedSessionSearch,
         sessionLoadSeqRef,
         historyMsgsSnapshotRef,
         chatMessagesSnapshotRef,
@@ -115,7 +116,7 @@ export function useAgentDetailSessionSelection({
             if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(true);
         }
         try {
-            const page = await chatSessionApi.listPage(agentId, { scope: 'mine', limit: refreshLimit, cursor: requestCursor || undefined, signal: controller.signal });
+            const page = await chatSessionApi.listPage(agentId, { scope: 'mine', query: debouncedSessionSearch || undefined, limit: refreshLimit, cursor: requestCursor || undefined, signal: controller.signal });
             const data = page.items.map((row: any) => normalizeChatSession(row));
             if (currentAgentIdRef.current === agentId && generation === sessionsListGenerationRef.current) {
                 if (append) {
@@ -159,7 +160,7 @@ export function useAgentDetailSessionSelection({
             if (!silent) setAllSessionsLoading(true);
         }
         try {
-            const page = await chatSessionApi.listPage(agentId, { scope: 'all', exclude_mine: true, limit: refreshLimit, cursor: requestCursor || undefined, signal: controller.signal });
+            const page = await chatSessionApi.listPage(agentId, { scope: 'all', exclude_mine: true, query: debouncedSessionSearch || undefined, limit: refreshLimit, cursor: requestCursor || undefined, signal: controller.signal });
             if (currentAgentIdRef.current !== agentId || generation !== allSessionsListGenerationRef.current) return [];
             const data = page.items.map((row: any) => normalizeChatSession(row));
             if (append) {
@@ -490,6 +491,12 @@ export function useAgentDetailSessionSelection({
         void restoreSessionFromUrl();
         return () => { cancelled = true; };
     }, [id, token, activeTab, currentUser?.id, requestedSessionId]);
+
+    useEffect(() => {
+        if (!id || !token || activeTab !== 'chat') return;
+        if (chat.chatScope === 'all' && canViewAllAgentChatSessions) void fetchAllSessions(false, false, id);
+        else void fetchMySessions(false, id);
+    }, [debouncedSessionSearch]);
 
     parseChatMsgRef.current = ({ msg, id: messageAgentId = id, activeSession: messageSession = activeSession }: any) => parseAgentDetailChatMsg({
         msg,

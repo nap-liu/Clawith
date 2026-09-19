@@ -1,6 +1,7 @@
 import React from 'react';
 import AgentSidePanel from '../../../components/AgentSidePanel';
 import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
+import SearchInput from '../../../components/ui/SearchInput';
 import ModelSwitcher from '../../../components/ModelSwitcher';
 import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
 import ConversationScrollToBottomButton from '../../../features/conversation/ConversationScrollToBottomButton';
@@ -25,6 +26,8 @@ type Props = {
     setScopeDropdownOpen: React.Dispatch<React.SetStateAction<boolean>>;
     chatScope: 'mine' | 'all';
     setChatScope: React.Dispatch<React.SetStateAction<'mine' | 'all'>>;
+    sessionSearch: string;
+    setSessionSearch: React.Dispatch<React.SetStateAction<string>>;
     onAdminTabMine: () => void;
     onAdminTabOthers: () => void;
     t: any;
@@ -166,6 +169,8 @@ export default function ChatTabContent(props: Props) {
         setScopeDropdownOpen,
         chatScope,
         setChatScope,
+        sessionSearch,
+        setSessionSearch,
         onAdminTabMine,
         onAdminTabOthers,
         t,
@@ -319,6 +324,7 @@ export default function ChatTabContent(props: Props) {
                         {!sessionListCollapsed && <button type="button" onClick={() => setSessionListCollapsed(true)} className="session-sidebar-toggle-btn" title={t('agent.chat.collapseSidebar')}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg></button>}
                     </div>
                     {(!canViewAllAgentChatSessions || chatScope === 'mine') && <div style={{ padding: '0 12px 8px' }}><button type="button" onClick={createNewSession} className="new-session-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden style={{ display: 'block', flexShrink: 0 }}><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg><span>{t('agent.chat.newSession')}</span></button></div>}
+                    <div style={{ padding: '0 12px 8px' }}><SearchInput value={sessionSearch} onChange={(event) => setSessionSearch(event.target.value)} maxLength={100} placeholder={t('agent.chat.searchPlaceholder')} aria-label={t('agent.chat.searchPlaceholder')} /></div>
                 </div>
                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                     {(!canViewAllAgentChatSessions || chatScope === 'mine') ? (
@@ -330,7 +336,7 @@ export default function ChatTabContent(props: Props) {
                             loadingMore={sessionsLoadingMore}
                             estimateSize={59}
                             loadingState={<div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>}
-                            emptyState={<div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('agent.chat.noSessionsYet')}<br />{t('agent.chat.clickToStart')}</div>}
+                            emptyState={<div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{sessionSearch.trim() ? t('agent.chat.noSearchResults') : <>{t('agent.chat.noSessionsYet')}<br />{t('agent.chat.clickToStart')}</>}</div>}
                             loadMoreLabel={t('common.loading')}
                             onLoadMore={() => fetchMySessions(true, id, true)}
                             renderItem={(s: any) => {
@@ -372,7 +378,7 @@ export default function ChatTabContent(props: Props) {
                             loadingMore={allSessionsLoadingMore}
                             estimateSize={48}
                             loadingState={<div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>{[...Array(3)].map((_, i) => <div key={i} style={{ padding: '6px 0', animation: 'pulse 1.5s ease-in-out infinite', animationDelay: `${i * 0.1}s` }}><div style={{ height: '12px', width: `${70 + (i % 3) * 10}%`, background: 'var(--bg-tertiary)', borderRadius: '4px', marginBottom: '6px' }} /><div style={{ height: '10px', width: `${40 + (i % 4) * 8}%`, background: 'var(--bg-tertiary)', borderRadius: '3px', opacity: 0.6 }} /></div>)}</div>}
-                            emptyState={<div style={{ padding: '16px 12px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>{t('agent.chat.noSessionsYet')}</div>}
+                            emptyState={<div style={{ padding: '16px 12px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>{sessionSearch.trim() ? t('agent.chat.noSearchResults') : t('agent.chat.noSessionsYet')}</div>}
                             loadMoreLabel={t('common.loading')}
                             onLoadMore={() => fetchAllSessions(true, true, id)}
                             renderItem={(s: any) => {

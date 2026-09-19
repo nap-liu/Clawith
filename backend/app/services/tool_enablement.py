@@ -27,11 +27,12 @@ from app.models.mcp_server import MCPServer
 # agree on one authoritative rule.
 REQUIRED_AGENT_TOOL_NAMES = frozenset({"send_media"})
 
-# One user-facing capability in the tool panel. The four protocol functions
+# One user-facing capability in the tool panel. The protocol functions
 # remain separate LLM tools, but their per-Agent enabled state moves together.
 SUBAGENT_TOOL_NAMES = frozenset(
     {
         "run_subagent",
+        "get_subagent_status",
         "send_message_to_subagent",
         "stop_subagent",
         "send_message_to_parent",

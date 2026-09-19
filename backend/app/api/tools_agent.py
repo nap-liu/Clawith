@@ -19,6 +19,8 @@ from app.api.tools_shared import (
     _globally_visible_tool_clause,
     _load_agent_tool_assignments,
     _reject_required_tool_disable,
+    _require_tenant_tool_admin,
+    _resolve_target_tenant_id,
     _tool_availability,
     _tool_record_visible_to_agent,
     get_tool_company_config,
@@ -310,6 +312,8 @@ async def list_agent_installed_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Admin endpoint: list user-installed tools scoped by tenant."""
+    target_tenant_id = _resolve_target_tenant_id(current_user, tenant_id)
+    _require_tenant_tool_admin(current_user, target_tenant_id)
     from app.models.agent import Agent
     query = (
         select(AgentTool, Tool, Agent)
@@ -319,7 +323,7 @@ async def list_agent_installed_tools(
         .order_by(AgentTool.created_at.desc())
     )
     # Scope by tenant: only show tools installed by agents in this tenant
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    tid = str(target_tenant_id) if target_tenant_id else None
     if tid:
         from app.models.agent import Agent as Ag
         # Some local/prod databases still have agents.tenant_id as varchar from

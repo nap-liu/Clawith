@@ -226,7 +226,7 @@ async def test_project_parent_event_stays_on_special_materialization_path(monkey
 
     batches, special_events = await runtime._pending_parent_event_groups([event.id])
     assert batches == []
-    assert special_events == [event.id]
+    assert special_events == [(parent_id, event.id)]
 
     async def fail_batch(_message_ids):
         raise AssertionError("project parent event must not enter ordinary batching")

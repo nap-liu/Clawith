@@ -194,6 +194,12 @@ async def test_group_session_visible_in_scope_mine_when_user_has_user_message():
         out = await list_sessions(
             agent_id=agent_id, scope="mine", current_user=alice, db=db,
         )
+        matching = await list_sessions(
+            agent_id=agent_id, scope="mine", query="alice", current_user=alice, db=db,
+        )
+        missing = await list_sessions(
+            agent_id=agent_id, scope="mine", query="not-present", current_user=alice, db=db,
+        )
 
     matches = [s for s in out if s.id == str(sess_id)]
     assert len(matches) == 1, f"alice should see the group session in scope=mine; got: {[s.id for s in out]}"
@@ -206,6 +212,8 @@ async def test_group_session_visible_in_scope_mine_when_user_has_user_message():
     assert s.unread_count == 0
     # Message count includes both user + assistant rows.
     assert s.message_count == 2
+    assert [item.id for item in matching] == [str(sess_id)]
+    assert missing == []
 
 
 async def test_group_session_hidden_in_scope_mine_when_user_has_no_messages():
@@ -276,6 +284,7 @@ async def test_governing_admin_can_list_and_read_group_without_membership(role: 
             agent_id=agent_id,
             scope="all",
             exclude_mine=True,
+            query="Governed group",
             current_user=admin,
             db=db,
         )
@@ -308,6 +317,7 @@ async def test_agent_admin_without_manage_access_cannot_view_all_sessions():
             await list_sessions(
                 agent_id=agent_id,
                 scope="all",
+                query="anything",
                 current_user=admin,
                 db=db,
             )
@@ -336,7 +346,7 @@ async def test_p2p_session_still_visible_in_scope_mine_for_owner():
 
     async with async_session() as db:
         out = await list_sessions(
-            agent_id=agent_id, scope="mine", current_user=owner, db=db,
+            agent_id=agent_id, scope="mine", query="owner", current_user=owner, db=db,
         )
 
     matches = [s for s in out if s.id == str(p2p_id)]
@@ -383,6 +393,7 @@ async def test_other_session_pages_filter_viewer_before_offset_and_load_without_
             page = await list_sessions(
                 agent_id=agent_id,
                 scope="mine",
+                query="Admin",
                 limit=2,
                 cursor=mine_cursor,
                 paginated=True,
@@ -400,6 +411,7 @@ async def test_other_session_pages_filter_viewer_before_offset_and_load_without_
             page = await list_sessions(
                 agent_id=agent_id,
                 scope="all",
+                query="Other",
                 limit=2,
                 cursor=cursor,
                 paginated=True,
@@ -503,6 +515,7 @@ async def test_other_sessions_exclude_groups_the_viewer_has_joined():
         page = await list_sessions(
             agent_id=agent_id,
             scope="all",
+            query="Group",
             limit=2,
             offset=0,
             paginated=True,

@@ -77,6 +77,7 @@ async def _pending_parent_events(
     project_scope: bool | None = None,
     legacy_count_out: list[int] | None = None,
     legacy_ids_out: set[uuid.UUID] | None = None,
+    exclude_ids: set[uuid.UUID] | None = None,
 ) -> list[uuid.UUID]:
     cutoff = datetime.now(UTC) - timedelta(seconds=max(0.0, debounce_seconds))
     async with async_session() as db:
@@ -124,6 +125,8 @@ async def _pending_parent_events(
                 if project_scope
                 else SubagentRun.project_id.is_(None)
             )
+        if exclude_ids:
+            active_query = active_query.where(ChatMessage.id.not_in(exclude_ids))
         active_rows = (
             (
                 await db.execute(
@@ -157,33 +160,36 @@ async def _pending_parent_events(
                 if project_scope is False
                 else True
             )
+            legacy_query = (
+                select(ChatMessage.id)
+                .join(
+                    SubagentRun,
+                    cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
+                )
+                .where(
+                    dispatch_state.is_(None),
+                    ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+                    ChatMessage.message_meta["kind"]
+                    .as_string()
+                    .in_(
+                        [
+                            SUBAGENT_PARENT_MESSAGE,
+                            SUBAGENT_COMPLETION,
+                            SUBAGENT_FAILURE,
+                        ]
+                    ),
+                    ChatMessage.created_at <= cutoff,
+                    ~completed_exists,
+                    ~project_materialized_exists,
+                    legacy_scope,
+                )
+            )
+            if exclude_ids:
+                legacy_query = legacy_query.where(ChatMessage.id.not_in(exclude_ids))
             legacy_rows = (
                 (
                     await db.execute(
-                        select(ChatMessage.id)
-                        .join(
-                            SubagentRun,
-                            cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
-                        )
-                        .where(
-                            dispatch_state.is_(None),
-                            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
-                            ChatMessage.message_meta["kind"]
-                            .as_string()
-                            .in_(
-                                [
-                                    SUBAGENT_PARENT_MESSAGE,
-                                    SUBAGENT_COMPLETION,
-                                    SUBAGENT_FAILURE,
-                                ]
-                            ),
-                            ChatMessage.created_at <= cutoff,
-                            ~completed_exists,
-                            ~project_materialized_exists,
-                            legacy_scope,
-                        )
-                        .order_by(ChatMessage.created_at, ChatMessage.id)
-                        .limit(limit)
+                        legacy_query.order_by(ChatMessage.created_at, ChatMessage.id).limit(limit)
                     )
                 )
                 .scalars()
@@ -196,28 +202,37 @@ async def _pending_parent_events(
         a2a_handoffs: list[uuid.UUID] = []
         remaining = max(0, limit - len(legacy_rows))
         if include_legacy and project_scope is not False and remaining:
+            a2a_query = (
+                select(ChatMessage.id)
+                .join(
+                    SubagentRun,
+                    cast(ChatMessage.conversation_id, String)
+                    == cast(SubagentRun.id, String),
+                )
+                .join(
+                    parent_session,
+                    parent_session.id == SubagentRun.parent_session_id,
+                )
+                .where(
+                    dispatch_state.is_(None),
+                    ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+                    ChatMessage.message_meta["kind"]
+                    .as_string()
+                    .in_([SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
+                    parent_session.source_channel == "agent",
+                    parent_session.project_id.is_not(None),
+                    project_materialized_exists,
+                    ~project_group_reply_exists,
+                )
+            )
+            if exclude_ids:
+                a2a_query = a2a_query.where(ChatMessage.id.not_in(exclude_ids))
             a2a_handoffs = (
                 (
                     await db.execute(
-                        select(ChatMessage.id)
-                        .join(
-                            SubagentRun,
-                            cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
+                        a2a_query.order_by(ChatMessage.created_at, ChatMessage.id).limit(
+                            remaining
                         )
-                        .join(parent_session, parent_session.id == SubagentRun.parent_session_id)
-                        .where(
-                            dispatch_state.is_(None),
-                            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
-                            ChatMessage.message_meta["kind"]
-                            .as_string()
-                            .in_([SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
-                            parent_session.source_channel == "agent",
-                            parent_session.project_id.is_not(None),
-                            project_materialized_exists,
-                            ~project_group_reply_exists,
-                        )
-                        .order_by(ChatMessage.created_at, ChatMessage.id)
-                        .limit(remaining)
                     )
                 )
                 .scalars()
