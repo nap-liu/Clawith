@@ -347,6 +347,16 @@ projection instead of a tool-specific fallback.
 AgentDir containment, tenant ownership and per-file validation remain mandatory;
 the tool cannot address an escaping or another Agent's path.
 
+Before rolling back to a backend image that predates this builtin, run the
+candidate image's idempotent compatibility helper:
+
+```bash
+python -m app.scripts.rollback_add_media_to_ctx
+```
+
+It transactionally removes only `add_media_to_ctx` and its explicit Agent
+assignments; ordinary media tools and historical conversation rows are kept.
+
 Provider-reported prompt usage and explicit provider overflow drive the shared
 context-recovery loop. Compaction replaces eligible closed history as one unit,
 so images in replaced rows naturally leave the active model request while audit
