@@ -334,11 +334,14 @@ input safety boundaries; they are not context-selection heuristics.
 
 The default, neutral `add_media_to_ctx` capability adds images from any
 valid path inside the current AgentDir rather than a product-folder allowlist.
-It verifies actual image bytes and returns standard assistant-visible multimodal
-tool-result blocks. The ordinary tool-result persistence and provider projection
+It verifies actual image bytes and returns standard multimodal tool-result blocks
+visible to the assistant and user. The ordinary persistence and provider projection
 then add those images to the current context and replay them while that tool
 round remains active. Restoring an image referenced by a compacted summary is
 one use of this general input capability, not a separate recall mechanism.
+The same standard image blocks are user-visible at the presentation boundary,
+so Web and H5 render them through the existing media result card used by other
+media tools; no tool-specific preview payload or frontend component is allowed.
 The tool itself never branches on provider, protocol or model capability. The
 shared tool-result projection layer uses the selected model's input modalities
 and `tool_result_multimodal_mode` to choose native or user-message projection;

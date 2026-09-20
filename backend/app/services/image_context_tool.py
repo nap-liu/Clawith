@@ -79,7 +79,10 @@ async def add_media_to_ctx(agent_id: Any, files: list[Any]) -> dict:
             "type": "image",
             "mimeType": mime,
             "data": base64.b64encode(raw).decode("ascii"),
-            "annotations": {"audience": ["assistant"]},
+            # The same standard result serves both consumers: providers receive
+            # the image as model context, while Web/H5 reuse the existing media
+            # result card instead of presenting an opaque tool-call row.
+            "annotations": {"audience": ["assistant", "user"]},
         })
         loaded_paths.append(path)
 

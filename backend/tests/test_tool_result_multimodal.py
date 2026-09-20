@@ -225,6 +225,21 @@ async def test_add_media_to_ctx_accepts_any_agentdir_path_and_projects_every_ima
     assert len(image_parts) == 2
     assert persisted["structuredContent"] == {"count": 2, "files": paths}
 
+    from app.services.tool_result_display import tool_result_for_display
+
+    display = tool_result_for_display(persisted)
+    attachments = [
+        block["attachment"]
+        for block in display["content"]
+        if block["type"] == "attachment"
+    ]
+    assert display["hasMedia"] is True
+    assert [attachment["kind"] for attachment in attachments] == ["image", "image"]
+    assert all(
+        attachment["path"].startswith(".tool_results/session/")
+        for attachment in attachments
+    )
+
 
 async def test_summary_and_replay_keep_private_content_out_of_model():
     from app.services.chat_history_loading import expand_tool_call_row
