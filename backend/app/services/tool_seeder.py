@@ -17,6 +17,7 @@ from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
 from app.services.media_ai_contract import MEDIA_AI_SEEDS
 from app.services.model_catalog_tool import MODEL_CATALOG_SEED
+from app.services.image_context_tool import IMAGE_CONTEXT_TOOL_SEED
 from app.services.agent_login_contract import AGENT_LOGIN_SEED
 from app.services.media_model_migration import migrate_legacy_media_configs
 from app.services.speech_model_selection import migrate_legacy_speech_configs
@@ -28,6 +29,7 @@ _settings = get_settings()
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
     "read_media",
+    "add_media_to_ctx",
     "update_self_settings",
     "run_subagent",
     "get_subagent_status",
@@ -138,6 +140,7 @@ from app.services.tool_seeder_builtin_6 import BUILTIN_TOOLS_PART_6
 BUILTIN_TOOLS = [
     AGENT_LOGIN_SEED,
     *MEDIA_AI_SEEDS,
+    IMAGE_CONTEXT_TOOL_SEED,
     MODEL_CATALOG_SEED,
     *BUILTIN_TOOLS_PART_1,
     *BUILTIN_TOOLS_PART_2,

@@ -20,7 +20,6 @@ IMAGE_DATA_PATTERN = re.compile(
     r'\[image_data:(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
 )
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # Match the inbound upload limit.
-MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 def _text_from_content(content: Any) -> tuple[str, list[dict[str, Any]], bool]:
@@ -101,50 +100,6 @@ def _canonical_content_image_part(part: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
-def _vision_image_positions(
-    states: list[dict[str, Any]],
-    *,
-    max_historical_images: int,
-) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
-    """Select structured or pathless legacy images under one history cap."""
-    last_user_index = next(
-        (index for index in range(len(states) - 1, -1, -1) if states[index]["message"].get("role") == "user"),
-        -1,
-    )
-    selected_attachments: set[tuple[int, int]] = set()
-    selected_legacy: set[tuple[int, int]] = set()
-    selected_paths: set[str] = set()
-    historical_count = 0
-    for message_index in range(len(states) - 1, -1, -1):
-        state = states[message_index]
-        if state["message"].get("role") != "user":
-            continue
-        attachments = state["attachments"]
-        has_structured_images = any(item.get("kind") == "image" for item in attachments)
-        for attachment_index in range(len(attachments) - 1, -1, -1):
-            if attachments[attachment_index].get("kind") != "image":
-                continue
-            path = attachments[attachment_index]["path"]
-            if path in selected_paths:
-                continue
-            if message_index == last_user_index:
-                selected_attachments.add((message_index, attachment_index))
-                selected_paths.add(path)
-            elif historical_count < max_historical_images:
-                selected_attachments.add((message_index, attachment_index))
-                selected_paths.add(path)
-                historical_count += 1
-        if has_structured_images:
-            continue
-        for legacy_index in range(len(state["legacy_image_parts"]) - 1, -1, -1):
-            if message_index == last_user_index:
-                selected_legacy.add((message_index, legacy_index))
-            elif historical_count < max_historical_images:
-                selected_legacy.add((message_index, legacy_index))
-                historical_count += 1
-    return selected_attachments, selected_legacy
-
-
 async def _mark_attachment_availability(
     *, agent_id: Any, attachments: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -170,8 +125,7 @@ async def _attachment_image_part(
     *,
     agent_id: Any,
     attachment: dict[str, Any],
-    remaining_bytes: int,
-) -> tuple[dict[str, Any], int] | None:
+) -> dict[str, Any] | None:
     if agent_id is None:
         return None
     key = agent_storage_key(agent_id, attachment["path"])
@@ -184,9 +138,6 @@ async def _attachment_image_part(
         if stat.size > MAX_IMAGE_BYTES:
             logger.info(f"[ImageContext] Skipping large image: {key} ({stat.size} bytes)")
             return None
-        if stat.size > remaining_bytes:
-            logger.info(f"[ImageContext] Skipping image beyond turn payload budget: {key}")
-            return None
         image_bytes = await storage.read_bytes(key)
     except Exception as exc:  # noqa: BLE001 - storage backends expose heterogeneous transport errors
         logger.warning(f"[ImageContext] Failed to read attachment {key}: {exc}")
@@ -197,13 +148,7 @@ async def _attachment_image_part(
         logger.warning(f"[ImageContext] Attachment is not a supported image: {key}")
         return None
     data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-    return {"type": "image_url", "image_url": {"url": data_url}}, len(image_bytes)
-
-
-def _legacy_image_size(part: dict[str, Any]) -> int:
-    url = str(part.get("image_url", {}).get("url") or "")
-    encoded = url.split(",", 1)[1] if "," in url else ""
-    return max(0, (len(encoded.rstrip("=")) * 3) // 4)
+    return {"type": "image_url", "image_url": {"url": data_url}}
 
 
 async def prepare_messages_for_model(
@@ -211,7 +156,6 @@ async def prepare_messages_for_model(
     *,
     agent_id: Any,
     supports_vision: bool,
-    max_historical_images: int = 3,
 ) -> list[dict[str, Any]]:
     """Prepare one immutable message view for the actual model attempt.
 
@@ -246,19 +190,12 @@ async def prepare_messages_for_model(
             }
         )
 
-    selected_attachments: set[tuple[int, int]] = set()
-    selected_legacy: set[tuple[int, int]] = set()
-    if supports_vision:
-        selected_attachments, selected_legacy = _vision_image_positions(
-            states, max_historical_images=max_historical_images
-        )
     prepared: list[dict[str, Any] | None] = [None] * len(states)
-    total_image_bytes = 0
 
-    # Newest-to-oldest loading gives the current turn first claim on the
-    # bounded payload budget, then the selected recent history.
-    for message_index in range(len(states) - 1, -1, -1):
-        state = states[message_index]
+    # Every image in active history reaches the selected vision model. Context
+    # pressure is owned by provider usage and shared compaction, not a second
+    # image-count or aggregate-byte policy in history construction.
+    for message_index, state in enumerate(states):
         message = state["message"]
         attachments = await _mark_attachment_availability(
             agent_id=agent_id, attachments=state["attachments"]
@@ -275,42 +212,26 @@ async def prepare_messages_for_model(
 
         image_parts: list[dict[str, Any]] = []
         if supports_vision:
-            for attachment_index, attachment in enumerate(attachments):
-                if (message_index, attachment_index) not in selected_attachments:
-                    continue
+            image_attachments = [
+                attachment
+                for attachment in attachments
+                if attachment.get("kind") == "image"
+            ]
+            for attachment in image_attachments:
                 loaded = await _attachment_image_part(
                     agent_id=agent_id,
                     attachment=attachment,
-                    remaining_bytes=max(0, MAX_TOTAL_IMAGE_BYTES - total_image_bytes),
                 )
-                if loaded is not None:
-                    image_part, image_size = loaded
-                    image_parts.append(image_part)
-                    total_image_bytes += image_size
-            legacy_selected = [
-                part
-                for legacy_index, part in enumerate(state["legacy_image_parts"])
-                if (message_index, legacy_index) in selected_legacy
-            ]
-            if legacy_selected:
-                for legacy_part in legacy_selected:
-                    image_size = _legacy_image_size(legacy_part)
-                    if total_image_bytes + image_size <= MAX_TOTAL_IMAGE_BYTES:
-                        image_parts.append(legacy_part)
-                        total_image_bytes += image_size
+                if loaded is None:
+                    continue
+                image_parts.append(loaded)
+            if not image_attachments:
+                image_parts.extend(state["legacy_image_parts"])
             elif not image_parts:
-                # A selected structured legacy path may no longer exist. Use
-                # only as many co-located old transport blocks as were selected,
-                # never bypassing the historical image cap.
-                fallback_count = sum(
-                    1 for index, _ in selected_attachments if index == message_index
-                )
-                if fallback_count:
-                    for legacy_part in state["legacy_image_parts"][-fallback_count:]:
-                        image_size = _legacy_image_size(legacy_part)
-                        if total_image_bytes + image_size <= MAX_TOTAL_IMAGE_BYTES:
-                            image_parts.append(legacy_part)
-                            total_image_bytes += image_size
+                # Old rows can contain both a structured path and its legacy
+                # inline transport. Use the inline copy only when every stored
+                # path is unavailable, never duplicate a successfully loaded image.
+                image_parts.extend(state["legacy_image_parts"][-len(image_attachments):])
 
         updated = {key: value for key, value in message.items() if key != "attachments"}
         if image_parts:

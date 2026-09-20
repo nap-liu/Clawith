@@ -161,6 +161,71 @@ async def test_media_persistence_rejects_foreign_agent_symlink(tmp_path, monkeyp
     assert list(foreign.rglob("*")) == []
 
 
+async def test_add_media_to_ctx_accepts_any_agentdir_path_and_projects_every_image(
+    tmp_path,
+    monkeypatch,
+):
+    from app.services.agent_runtime_workspace import AgentRuntimeWorkspace
+    from app.services.image_context_tool import add_media_to_ctx
+    from app.services.storage_runtime.local import LocalStorageBackend
+    from app.services import image_context_tool
+
+    own = tmp_path / "own"
+    paths = ["memory/archive/first.png", "custom/nested/second.data"]
+    for path in paths:
+        target = own / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x89PNG\r\n\x1a\nimage-" + path.encode())
+    workspace = AgentRuntimeWorkspace("own", own, "own")
+    storage = LocalStorageBackend(str(tmp_path))
+    monkeypatch.setattr(image_context_tool, "current_agent_runtime_workspace", lambda _: workspace)
+    monkeypatch.setattr(image_context_tool, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(tool_results, "current_agent_runtime_workspace", lambda _: workspace)
+    monkeypatch.setattr(tool_results, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(tool_result_projection, "current_agent_runtime_workspace", lambda _: workspace)
+    monkeypatch.setattr(tool_result_projection, "get_storage_backend", lambda: storage)
+
+    result_value = await add_media_to_ctx("own", paths)
+    persisted = await tool_results.persist_tool_result(
+        result_value,
+        agent_id="own",
+        session_id="session",
+    )
+    projected = await tool_result_projection.project_tool_results(
+        [
+            LLMMessage(role="assistant", tool_calls=[{
+                "id": "recall",
+                "type": "function",
+                "function": {"name": "add_media_to_ctx", "arguments": "{}"},
+            }]),
+            LLMMessage(
+                role="tool",
+                tool_call_id="recall",
+                content=tool_results.tool_result_text(persisted),
+                tool_result=persisted,
+            ),
+        ],
+        model=SimpleNamespace(
+            provider="openai",
+            api_protocol="openai_compatible",
+            tool_result_multimodal_mode="user_message",
+            supports_vision=True,
+            input_modalities=["text", "image"],
+        ),
+        agent_id="own",
+    )
+
+    image_parts = [
+        part
+        for message in projected
+        if isinstance(message.content, list)
+        for part in message.content
+        if part.get("type") == "image_url"
+    ]
+    assert len(image_parts) == 2
+    assert persisted["structuredContent"] == {"count": 2, "files": paths}
+
+
 async def test_summary_and_replay_keep_private_content_out_of_model():
     from app.services.chat_history_loading import expand_tool_call_row
     from app.services.llm.compactor_serialization import serialize_span_for_summary
@@ -175,7 +240,8 @@ async def test_summary_and_replay_keep_private_content_out_of_model():
     for prefilter in (True, False):
         summary = serialize_span_for_summary([row], prefilter=prefilter)
         assert "not model content" not in summary and "USER_ONLY" not in summary
-        assert "capture result" in summary and '"count": 2' in summary.replace('\\"', '"')
+        assert "capture result" in summary
+        assert '"count": 2' not in summary.replace('\\"', '"')
     replay = expand_tool_call_row(row)[-1]
     assert replay["content"] == bounded
     assert "USER_ONLY" not in replay["content"]

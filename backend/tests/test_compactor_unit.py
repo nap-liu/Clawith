@@ -91,12 +91,13 @@ def test_root_objective_is_preserved_with_three_trailing_user_refinements():
         ],
     )
 
-    assert items == [
+    assert [item.splitlines()[-1] for item in items] == [
         "ROOT OBJECTIVE: publish only after neutral audit",
         "detail one",
         "detail two",
         "detail three",
     ]
+    assert all(item.startswith("[Source: row_id=") for item in items)
 
 
 def test_progressive_epoch_preserves_new_goal_before_trailing_confirmations():
@@ -123,8 +124,26 @@ def test_progressive_epoch_preserves_new_goal_before_trailing_confirmations():
     )
 
     assert items[0] == "ROOT GOAL"
-    assert "NEW CURRENT GOAL" in items
-    assert items[-3:] == ["okay one", "okay two", "okay three"]
+    assert any(item.endswith("NEW CURRENT GOAL") for item in items)
+    assert [item.splitlines()[-1] for item in items[-3:]] == [
+        "okay one", "okay two", "okay three",
+    ]
+
+
+def test_objective_evidence_reads_current_constraints_heading():
+    prior = """\
+## Summary of earlier conversation
+
+### Current objective and constraints
+- Preserve this exact new-format objective.
+
+### Progress and key context
+- Work remains open.
+"""
+
+    items = objective_evidence_items_from_rows(prior_summary=prior, rows=[])
+
+    assert items == ["- Preserve this exact new-format objective."]
 
 
 def _model(context_window=131072, ratio=0.85, keep=3, summary_max=2000, usage_ratio=1.0):
@@ -165,6 +184,92 @@ def test_summary_serialization_preserves_structured_attachment_identity():
     assert "文件名：report.pdf" in serialized
     assert "路径：workspace/uploads/report.pdf" in serialized
     assert "base64" not in serialized
+
+
+def test_summary_serialization_preserves_external_context_and_provenance():
+    row_id = uuid.uuid4()
+    sender_agent_id = uuid.uuid4()
+    row = SimpleNamespace(
+        id=row_id,
+        role="user",
+        content="继续处理",
+        message_meta={
+            "kind": "project_subagent_reply",
+            "source_channel": "a2a",
+            "external_context": {"requirement": "必须先完成中立审计"},
+        },
+        sender_agent_id=sender_agent_id,
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+    )
+
+    serialized = serialize_span_for_summary([row], prefilter=False)
+
+    assert "必须先完成中立审计" in serialized
+    assert f"row_id={row_id}" in serialized
+    assert "kind=project_subagent_reply" in serialized
+    assert "source_channel=a2a" in serialized
+    assert f"sender_agent_id={sender_agent_id}" in serialized
+
+
+def test_summary_serialization_hides_reasoning_and_deduplicates_running_tool_marker():
+    call_id = "call-1"
+    anchor_id = uuid.uuid4()
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    running = SimpleNamespace(
+        id=uuid.uuid4(), role="tool_call",
+        message_meta={"turn_anchor_id": str(anchor_id)}, created_at=now,
+        content=json.dumps({
+            "name": "unknown_future_action", "call_id": call_id,
+            "args": {"path": "workspace/input.dat"}, "status": "running",
+            "reasoning_content": "PRIVATE_CHAIN_OF_THOUGHT", "round_id": "round-1",
+        }),
+    )
+    done = SimpleNamespace(
+        id=uuid.uuid4(), role="tool_call",
+        message_meta={"turn_anchor_id": str(anchor_id)}, created_at=now + timedelta(seconds=1),
+        content=json.dumps({
+            "name": "unknown_future_action", "call_id": call_id,
+            "args": {"path": "workspace/input.dat"}, "status": "done",
+            "result": "observable result", "reasoning_content": "PRIVATE_CHAIN_OF_THOUGHT",
+            "round_id": "round-1", "round_tool_index": 0,
+        }),
+    )
+
+    serialized = serialize_span_for_summary([running, done], prefilter=False)
+
+    assert serialized.count("unknown_future_action") == 1
+    assert "observable result" in serialized
+    assert "PRIVATE_CHAIN_OF_THOUGHT" not in serialized
+    assert "round-1" not in serialized
+
+
+def test_summary_serialization_never_folds_reused_call_id_across_rounds():
+    anchor_id = uuid.uuid4()
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    rows = [
+        SimpleNamespace(
+            id=uuid.uuid4(), role="tool_call",
+            message_meta={"turn_anchor_id": str(anchor_id)}, created_at=now,
+            content=json.dumps({
+                "name": "first_unknown_action", "call_id": "reused",
+                "args": {}, "status": "running", "round_id": "round-1",
+            }),
+        ),
+        SimpleNamespace(
+            id=uuid.uuid4(), role="tool_call",
+            message_meta={"turn_anchor_id": str(anchor_id)}, created_at=now + timedelta(seconds=1),
+            content=json.dumps({
+                "name": "second_unknown_action", "call_id": "reused",
+                "args": {}, "status": "done", "round_id": "round-2",
+                "result": "second result",
+            }),
+        ),
+    ]
+
+    serialized = serialize_span_for_summary(rows, prefilter=False)
+
+    assert "first_unknown_action" in serialized
+    assert "second_unknown_action" in serialized
 
 
 def test_summary_serialization_never_truncates_attachment_paths_in_long_user_row():
@@ -257,55 +362,47 @@ async def test_summary_sender_attribution_is_enabled_only_for_group_sessions(mon
     display_names.assert_awaited_once()
 
 
-def test_attachment_path_with_spaces_is_mechanically_preserved_from_summary_input():
-    original = """\
-### [user] @ 2026-08-14T00:00:00+00:00
-[文件附件]
-文件名：my report.pdf
-路径：workspace/uploads/my report.pdf
-"""
-    summary = """\
-## Summary of earlier conversation
-
-### Current objective and progress
-- Review the uploaded report.
-
-### Goal ledger
-- Active: Review the report.
-- Achieved: The report was uploaded.
-- Not achieved / blocked: Review remains incomplete.
-
-### Related task handoff
-- Task/project/focus item: report review.
-- Owner: current agent.
-- Status: active.
-- Completed evidence: report upload is present.
-- Remaining steps: inspect the report.
-- Blockers: none evidenced.
-- Next action: inspect the uploaded report.
-- Archive/file paths: none evidenced.
-
-### Key facts
-- The user uploaded a report for review.
-### Open items
-- Complete the review.
-
-""" + ("Additional context. " * 20)
-
-    repaired, missing = append_missing_identifiers(
-        summary=summary,
-        original_text=original,
+def test_attachment_path_with_spaces_is_preserved_in_summary_input():
+    row = SimpleNamespace(
+        id=uuid.uuid4(), role="user", content="Review the upload",
+        message_meta={"attachments": [{"name": "my report.pdf", "path": "workspace/uploads/my report.pdf"}]},
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
     )
+    serialized = serialize_span_for_summary([row], prefilter=False)
+    assert "workspace/uploads/my report.pdf" in serialized
 
-    assert "workspace/uploads/my report.pdf" in missing
-    assert "- workspace/uploads/my report.pdf" in repaired
-    passed, reason, recall = validate_summary(
-        summary=pin_summary_objective(summary=repaired, original_text=original),
-        original_text=original,
-        max_tokens=2000,
+
+def test_tool_summary_input_reuses_saved_model_view_without_full_reexpansion():
+    row = SimpleNamespace(
+        id=uuid.uuid4(), role="tool_call",
+        content=json.dumps({
+            "name": "unknown_future_action",
+            "status": "done",
+            "result": "TRUNCATED: full output saved elsewhere",
+            "tool_result": {
+                "content": [{"type": "text", "text": "FULL-PRIVATE-LARGE-BODY"}],
+            },
+        }),
+        message_meta={}, created_at=datetime(2026, 8, 14, tzinfo=UTC),
     )
-    assert passed is True, reason
-    assert recall == 1.0
+    serialized = serialize_span_for_summary([row], prefilter=False)
+    assert "unknown_future_action" in serialized
+    assert "TRUNCATED: full output saved elsewhere" in serialized
+    assert "FULL-PRIVATE-LARGE-BODY" not in serialized
+
+
+def test_recalled_tool_summary_input_cannot_restore_tool_body():
+    row = SimpleNamespace(
+        id=uuid.uuid4(), role="tool_call",
+        content=json.dumps({
+            "name": "future_action", "status": "done", "result": "RECALLED-SECRET",
+        }),
+        message_meta={"delivery": {"recall": {"status": "recalled"}}},
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+    )
+    serialized = serialize_span_for_summary([row], prefilter=False)
+    assert "已撤回" in serialized
+    assert "RECALLED-SECRET" not in serialized
 
 
 # ─── should_compact ──────────────────────────────────────────────────
@@ -495,40 +592,20 @@ class TestPrefilter:
 _GOOD_SUMMARY = """\
 ## Summary of earlier conversation
 
-### Current objective and progress
-- Complete the report review; edits are done and review is pending.
+### Current objective and constraints
+- Complete the report review without publishing before Alice approves.
 
-### Goal ledger
-- Active: Complete the report review.
-- Achieved: Report edits are done.
-- Not achieved / blocked: Review by Alice is pending.
-
-### Related task handoff
-- Task/project/focus item: report review.
-- Owner: Alice.
-- Status: pending review.
-- Completed evidence: edits are done.
-- Remaining steps: review the report.
-- Blockers: Alice's review is pending.
-- Next action: review workspace/report.md.
-- Archive/file paths: workspace/report.md.
-
-### Key facts
+### Progress and key context
 - Project ID: 49b2c1ab12cd34ef5678901234abcdef
 - File: workspace/report.md was edited
-
-### Decisions made
 - Switched to qwen3.5-plus
 
-### Files / paths / IDs referenced
+### Next actions and blockers
+- Alice's review is pending; inspect workspace/report.md next.
+
+### Necessary references
 - workspace/report.md
 - workspace/draft.md
-
-### Tool calls performed
-- read_file(path=workspace/report.md) → 1.2KB
-
-### Open items
-- Pending review by Alice
 """
 
 
@@ -540,9 +617,12 @@ async def test_summary_provider_request_uses_no_local_input_estimator(monkeypatc
     class _Client:
         closed = False
 
-        async def complete(self, messages, **_kwargs):
+        async def stream(self, messages, **_kwargs):
             captured["messages"] = messages
-            return SimpleNamespace(content="summary", usage={"completion_tokens": 1})
+            return SimpleNamespace(
+                content="summary", usage={"completion_tokens": 1},
+                finish_reason="stop", tool_calls=[],
+            )
 
         async def close(self):
             self.closed = True
@@ -580,7 +660,7 @@ async def test_summary_provider_client_closes_when_request_raises(monkeypatch):
     class _Client:
         closed = False
 
-        async def complete(self, *_args, **_kwargs):
+        async def stream(self, *_args, **_kwargs):
             raise RuntimeError("summary provider failed")
 
         async def close(self):

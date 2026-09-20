@@ -64,7 +64,14 @@ async def test_media_summary_uses_configured_enterprise_model_streaming_protocol
         calls.append(body)
         assert body["stream"] is True
         assert request.headers["Authorization"] == "Bearer test-key"
-        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"Summary text"}}]}\n\ndata: [DONE]\n\n')
+        return httpx.Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"Summary text"}}]}\n\n'
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                'data: [DONE]\n\n'
+            ),
+        )
 
     mock_http(monkeypatch, upstream)
     text, _ = await _summarize_via_llm(span_text="Remember the blue circle", prior_summary=None, model=model)

@@ -59,18 +59,7 @@ async def load_messages_for_session(
     all_active_rows = [
         row
         for row in reversed(rows_q.scalars().all())
-        if not (
-            _is_hidden_runtime_anchor(row)
-            or
-            isinstance(getattr(row, "message_meta", None), dict)
-            and (
-                row.message_meta.get("consumed_by_onmessage")
-                or row.message_meta.get("delivery_claim")
-                or row.message_meta.get("kind") == "subagent_parent_message"
-                or row.message_meta.get("turn_inbox_state")
-                in {"pending", "processing", "cancelled"}
-            )
-        )
+        if is_model_visible_history_row(row)
     ]
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
@@ -599,13 +588,9 @@ def build_llm_messages_from_rows(
     out: list[dict[str, Any]] = []
     emitted_rounds: set[str] = set()
     for m in rows:
+        if not is_model_visible_history_row(m):
+            continue
         meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
-        if meta.get("turn_control_only") or meta.get("artifact_role") == "command_reply":
-            continue
-        # This visible row mirrors assistant_content on the confirmation tool
-        # row. Keep it for UI rendering, but avoid replaying both copies.
-        if m.role == "assistant" and meta.get("artifact_role") == "confirmation_intro":
-            continue
         delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
         recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
         if m.role == "tool_call" and recall.get("status") == "recalled":

@@ -85,6 +85,48 @@ async def test_explicit_new_disable_wins_and_old_call_uses_same_permission(conte
         assert await db.scalar(select(AgentTool).where(AgentTool.agent_id == context.agent_id, AgentTool.tool_id == old_id)) is None
 
 
+async def test_legacy_assignment_without_tenant_does_not_abort_startup_migration(
+    context,
+    monkeypatch,
+):
+    from app.models.agent import Agent
+    from types import SimpleNamespace
+
+    old_id, model_id = await legacy(context)
+    async with async_session() as db:
+        assignment = await db.scalar(select(AgentTool).where(
+            AgentTool.agent_id == context.agent_id,
+            AgentTool.tool_id == old_id,
+        ))
+        assignment.config = {"fallback_model_id": str(model_id)}
+        real_get = db.get
+
+        async def get_with_legacy_tenantless_agent(model, identity, *args, **kwargs):
+            if model is Agent and identity == context.agent_id:
+                return SimpleNamespace(tenant_id=None)
+            return await real_get(model, identity, *args, **kwargs)
+
+        monkeypatch.setattr(db, "get", get_with_legacy_tenantless_agent)
+        await migrate_read_image(db)
+        await db.commit()
+
+    async with async_session() as db:
+        new = await db.scalar(select(Tool).where(Tool.name == "read_media"))
+        assignment = await db.scalar(select(AgentTool).where(
+            AgentTool.agent_id == context.agent_id,
+            AgentTool.tool_id == new.id,
+        ))
+        assert assignment is not None and assignment.enabled is True
+        assert assignment.config == {
+            "understanding_model_id": str(model_id),
+            "fallback_model_id": str(model_id),
+        }
+        assert await db.scalar(select(AgentTool).where(
+            AgentTool.agent_id == context.agent_id,
+            AgentTool.tool_id == old_id,
+        )) is None
+
+
 async def test_legacy_batch_call_is_one_durable_async_media_input(context):
     await legacy(context)
     await seed_builtin_tools()

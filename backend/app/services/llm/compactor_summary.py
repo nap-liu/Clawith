@@ -55,8 +55,14 @@ _ROLE_BLOCK_RE = re.compile(
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _OBJECTIVE_SECTION_RE = re.compile(
-    r"(^###\s+Current objective and progress\s*$)(?P<body>.*?)(?=^###\s+|\Z)",
+    r"(^###\s+Current objective and (?:progress|constraints)\s*$)(?P<body>.*?)(?=^###\s+|\Z)",
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+_CONTINUITY_SECTIONS = (
+    "Current objective and constraints",
+    "Progress and key context",
+    "Next actions and blockers",
+    "Necessary references",
 )
 
 
@@ -245,72 +251,31 @@ def validate_summary(
     objective_evidence_items: list[str] | None = None,
     objective_archived: bool = False,
 ) -> tuple[bool, str | None, float]:
-    """Return ``(passed, fail_reason, uuid_recall_ratio)``.
+    """Validate that a generated handoff is loadable and structurally complete.
 
-    Structure is a hard gate; the UUID/path recall metric is
-    a quality signal.
+    Semantic truth cannot be proven by substring or identifier recall. The
+    third return value remains for compatibility and is always ``1.0`` after
+    structural success.
     """
     s = (summary or "").strip()
 
     # Markdown emphasis does not change a section/field's meaning. Normalize
     # only the structural view; exact evidence and identifiers use the original.
     structure = s.replace("**", "").replace("__", "")
-    if len(_HEADING_RE.findall(structure)) < 2:
+    if len(_HEADING_RE.findall(structure)) < len(_CONTINUITY_SECTIONS):
         return False, "missing_section_headings", 0.0
-    if not _CURRENT_OBJECTIVE_HEADING_RE.search(structure):
-        return False, "missing_current_objective_section", 0.0
-    if not _GOAL_LEDGER_HEADING_RE.search(structure):
-        return False, "missing_goal_ledger_section", 0.0
-    if not _GOAL_LEDGER_ACTIVE_RE.search(structure):
-        return False, "missing_active_goal", 0.0
-    if not _GOAL_LEDGER_ACHIEVED_RE.search(structure):
-        return False, "missing_achieved_goals", 0.0
-    if not _GOAL_LEDGER_UNFINISHED_RE.search(structure):
-        return False, "missing_unfinished_goals", 0.0
-    if not _RELATED_TASK_HEADING_RE.search(structure):
-        return False, "missing_related_task_handoff", 0.0
-    related_match = _RELATED_TASK_SECTION_RE.search(structure)
-    related_body = related_match.group("body").strip() if related_match else ""
-    if not re.search(r"^\s*-\s*None evidenced[.!。]?\s*$", related_body, re.MULTILINE | re.IGNORECASE):
-        missing_fields = [
-            label
-            for label, pattern in _RELATED_TASK_REQUIRED_FIELDS
-            if not pattern.search(related_body)
-        ]
-        if missing_fields:
-            return False, "incomplete_related_task_handoff:" + ",".join(missing_fields), 0.0
-    if not _OPEN_ITEMS_HEADING_RE.search(structure):
-        return False, "missing_open_items_section", 0.0
+    for title in _CONTINUITY_SECTIONS:
+        section = re.search(
+            rf"^###\s+{re.escape(title)}\s*$\n(?P<body>.*?)(?=^###\s+|\Z)",
+            structure,
+            re.MULTILINE | re.DOTALL | re.IGNORECASE,
+        )
+        if section is None:
+            return False, f"missing_section:{title.lower().replace(' ', '_')}", 0.0
+        if not section.group("body").strip():
+            return False, f"empty_section:{title.lower().replace(' ', '_')}", 0.0
 
-    # UUID + path recall: how much of what was in the original made it
-    # into the summary, as a proxy for "didn't lose critical IDs".
-    original_ids = extract_preserved_identifiers(original_text)
-    ratio = 1.0
-    if original_ids:
-        recalled = sum(1 for ident in original_ids if ident in s)
-        ratio = recalled / len(original_ids)
-        if ratio < UUID_RECALL_THRESHOLD:
-            return (
-                False,
-                f"low_id_recall ({recalled}/{len(original_ids)} = {ratio:.2f} < {UUID_RECALL_THRESHOLD})",
-                ratio,
-            )
-
-    evidence = extract_objective_evidence(
-        objective_text if objective_text is not None else original_text,
-        max_chars=(
-            objective_evidence_max_chars
-            if objective_evidence_max_chars is not None
-            else objective_evidence_limit(max_tokens)
-        ),
-        evidence_items=objective_evidence_items,
-    )
-    objective_match = _OBJECTIVE_SECTION_RE.search(s)
-    objective_body = objective_match.group("body") if objective_match else ""
-    if evidence and evidence not in objective_body and not objective_archived:
-        return False, "objective_evidence_missing", ratio
-
-    return True, None, ratio
+    return True, None, 1.0
 
 
 def build_deterministic_summary(
@@ -320,113 +285,62 @@ def build_deterministic_summary(
     archive_envelope: str | None = None,
     objective_evidence_items: list[str] | None = None,
 ) -> str:
-    """Build a valid, bounded summary without depending on an LLM response.
-
-    This is a last-resort availability path, not the normal summarizer. The
-    complete source is materialized first and its readable path is embedded in
-    the result; excerpts improve immediate continuity but are never the only
-    surviving copy of the compacted facts.
-    """
-    max_chars = DETERMINISTIC_SUMMARY_MAX_CHARS
-    archive_reference = ""
-    if archive_envelope:
-        saved_path = _PERSISTED_SAVED_PATH_RE.search(archive_envelope)
-        if saved_path:
-            archive_reference = (
-                "<persisted-output>\n"
-                f"Full output saved to: {saved_path.group(1)}\n"
-                "</persisted-output>"
-            )
+    """Build bounded recovery material after generation cannot be trusted."""
+    saved_path = (
+        _PERSISTED_SAVED_PATH_RE.search(archive_envelope or "")
+        if archive_envelope
+        else None
+    )
+    path = saved_path.group(1) if saved_path else "unavailable"
+    archive_reference = (
+        "<persisted-output>\n"
+        f"Full output saved to: {path}\n"
+        "</persisted-output>"
+        if saved_path
+        else "- Original compaction history: unavailable."
+    )
     objective_evidence = extract_objective_evidence(
         source_text,
-        max_chars=objective_evidence_limit(max_tokens),
+        max_chars=2_400,
         evidence_items=objective_evidence_items,
     )
-    def _fixed(evidence: str) -> str:
-        rendered = (
-            "## Summary of earlier conversation\n\n"
-            "### Current objective and progress\n"
-            f"- {evidence}\n\n"
-            "### Goal ledger\n"
-            f"- Active: {evidence}\n"
-            "- Achieved: Only goals explicitly evidenced as completed in the excerpts/archive; "
-            "no additional completion is inferred.\n"
-            "- Not achieved / blocked: Preserve every unresolved or blocked goal from the "
-            "excerpts/archive for continuation.\n\n"
-            "### Related task handoff\n"
-            "- Task/project/focus item: Preserve exact evidenced name/ID, or none evidenced.\n"
-            "- Owner: Preserve evidenced owner, or not evidenced.\n"
-            "- Status: Active unless the source explicitly proves another status.\n"
-            "- Completed evidence: Only completion explicitly present in the excerpts/archive.\n"
-            "- Remaining steps: Preserve unresolved steps from the excerpts/archive.\n"
-            "- Blockers: Preserve evidenced blockers, or none evidenced.\n"
-            "- Next action: Continue the active objective using the excerpts/archive.\n"
-            f"- Archive/file paths: {saved_path.group(1) if archive_envelope and saved_path else 'none evidenced'}.\n\n"
-            "### Key facts and chronology\n"
-        )
-        if archive_reference:
-            rendered += (
-                "- Archive below.\n\n"
-                "### Lossless continuity archive\n"
-                f"{archive_reference}\n"
-            )
-        return rendered
-
-    fixed = _fixed(
-        objective_evidence or "Continue from recent turns."
+    objective_candidates = (
+        "- Unverified original instruction candidates follow; reconcile later changes in the archive:\n"
+        + objective_evidence
+        if objective_evidence
+        else "- No bounded objective candidate was available; consult the archive."
     )
-    closing = (
-        "\n\n### Open items\n"
-        "- Continue; use the archive if needed."
+    header = (
+        "## Summary of earlier conversation\n\n"
+        "### Current objective and constraints\n"
+        "- Degraded recovery: the current objective could not be verified from a semantic summary. "
+        "Consult the archived original history before acting.\n"
+        f"{objective_candidates}\n\n"
+        "### Progress and key context\n"
+        "- The excerpts below are original source material, not a verified completion record.\n"
     )
-    if len(fixed + closing) > max_chars:
-        fixed = _fixed("Continue from recent turns.")
-    available = max(0, max_chars - len(fixed) - len(closing))
-    cleaned_lines = [line.strip() for line in (source_text or "").splitlines() if line.strip()]
-    selected: list[str] = []
+    footer = (
+        "\n\n### Next actions and blockers\n"
+        "- Reconcile the current objective, authorization, and execution status from the archived "
+        "history before continuing or repeating any external action.\n\n"
+        "### Necessary references\n"
+        f"{archive_reference}\n"
+        "- This recovery text is bounded and may omit context; the archive is authoritative."
+    )
+    available = max(0, DETERMINISTIC_SUMMARY_MAX_CHARS - len(header) - len(footer))
+    lines = [line.strip() for line in (source_text or "").splitlines() if line.strip()]
+    excerpts: list[str] = []
     used = 0
-    # Alternate old and new material so a large middle block cannot erase the
-    # beginning or the latest state of the compacted span.
-    ordered: list[str] = []
-    left, right = 0, len(cleaned_lines) - 1
-    while left <= right:
-        ordered.append(cleaned_lines[left])
-        left += 1
-        if left <= right:
-            ordered.append(cleaned_lines[right])
-            right -= 1
-    for line in ordered:
-        excerpt = line[:600]
-        rendered = f"- {excerpt}"
-        candidate_lines = [*selected, rendered]
-        candidate_summary = fixed + "\n".join(candidate_lines) + closing
+    for line in reversed(lines):
+        rendered = f"- {line[:600]}"
         if used + len(rendered) + 1 > available:
             continue
-        selected.append(rendered)
+        excerpts.append(rendered)
         used += len(rendered) + 1
-    if not selected and available:
-        placeholder = "- Earlier conversation was compacted; consult the lossless archive when needed."
-        candidate = placeholder[:available]
-        if len(fixed + candidate + closing) <= max_chars:
-            selected.append(candidate)
-
-    summary = fixed + "\n".join(selected) + closing
-    missing_identifiers = sorted(
-        identifier
-        for identifier in extract_preserved_identifiers(source_text)
-        if identifier not in summary
-    )
-    if missing_identifiers:
-        appendix = "\n\n### Preserved identifiers"
-        for identifier in missing_identifiers:
-            candidate = f"{appendix}\n- {identifier}" if appendix else f"\n- {identifier}"
-            candidate_summary = summary + candidate
-            if len(candidate_summary) > max_chars:
-                break
-            summary = candidate_summary
-            appendix = ""
-
-    return summary
+    excerpts.reverse()
+    if not excerpts:
+        excerpts = ["- No inline excerpt fits; use the archived original history."]
+    return header + "\n".join(excerpts) + footer
 
 
 def append_lossless_archive_reference(*, summary: str, relative_path: str) -> str:
@@ -439,9 +353,8 @@ def append_lossless_archive_reference(*, summary: str, relative_path: str) -> st
     """
     section = (
         "### Lossless continuity archive\n"
-        "- Some source content exceeded the bounded inline summary view. "
-        "The complete, unabridged source for this compaction "
-        "must be consulted when exact omitted requirements are needed.\n"
+        "- The complete source replaced by this compaction is retained here. "
+        "Consult it when exact requirements or omitted execution details are needed.\n"
         "<persisted-output>\n"
         f"Full output saved to: {relative_path}\n"
         "</persisted-output>"

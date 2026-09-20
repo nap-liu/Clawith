@@ -21,6 +21,22 @@ IMAGE_PROMPT = (
 )
 
 
+def normalize_image_model_references(config: dict) -> dict:
+    """Rename legacy model keys without resolving them against a tenant."""
+    normalized = {}
+    understanding = (
+        config.get("understanding_model_id")
+        or config.get("model_id")
+        or config.get("fallback_model_id")
+    )
+    fallback = config.get("fallback_model_id")
+    if understanding:
+        normalized["understanding_model_id"] = str(understanding)
+    if fallback:
+        normalized["fallback_model_id"] = str(fallback)
+    return normalized
+
+
 def normalize_read_image_call(name: str, arguments: dict) -> tuple[str, dict]:
     if name != "read_image":
         return name, arguments
@@ -94,7 +110,14 @@ async def migrate_read_image(db) -> None:
             await db.delete(assignment)
             continue
         agent = await db.get(Agent, assignment.agent_id)
-        config = await image_model_reference(db, agent.tenant_id, assignment.config or {})
+        # Legacy/system rows may predate mandatory tenant ownership. They can
+        # keep the normalized assignment, but cannot create tenant-scoped model
+        # bindings until ownership is repaired.
+        config = (
+            await image_model_reference(db, agent.tenant_id, assignment.config or {})
+            if agent is not None and agent.tenant_id is not None
+            else normalize_image_model_references(assignment.config or {})
+        )
         assignment.tool_id = new.id
         assignment.enabled = bool(assignment.enabled and was_enabled)
         assignment.config = config

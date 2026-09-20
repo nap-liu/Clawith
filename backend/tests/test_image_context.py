@@ -201,7 +201,7 @@ async def test_vision_rejects_non_image_bytes_even_when_metadata_claims_image(mo
     assert "base64" not in prepared[0]["content"]
 
 
-async def test_legacy_historical_images_share_one_newest_first_limit():
+async def test_all_legacy_historical_images_reach_the_vision_model():
     messages = [
         {
             "role": "user",
@@ -214,11 +214,10 @@ async def test_legacy_historical_images_share_one_newest_first_limit():
         messages,
         agent_id=uuid.uuid4(),
         supports_vision=True,
-        max_historical_images=3,
     )
 
     assert [isinstance(message["content"], list) for message in prepared] == [
-        False,
+        True,
         True,
         True,
         True,
@@ -226,7 +225,7 @@ async def test_legacy_historical_images_share_one_newest_first_limit():
     ]
 
 
-async def test_structured_and_legacy_images_share_historical_limit(monkeypatch):
+async def test_structured_and_legacy_images_are_all_retained(monkeypatch):
     agent_id = uuid.uuid4()
     files: dict[str, bytes] = {}
     messages: list[dict] = []
@@ -251,11 +250,10 @@ async def test_structured_and_legacy_images_share_historical_limit(monkeypatch):
         messages,
         agent_id=agent_id,
         supports_vision=True,
-        max_historical_images=3,
     )
 
     assert [isinstance(message["content"], list) for message in prepared] == [
-        False,
+        True,
         True,
         True,
         True,
@@ -263,12 +261,11 @@ async def test_structured_and_legacy_images_share_historical_limit(monkeypatch):
     ]
 
 
-async def test_current_images_obey_one_total_payload_budget(monkeypatch):
+async def test_multiple_current_images_are_not_aggregate_byte_truncated(monkeypatch):
     agent_id = uuid.uuid4()
     first = b"\x89PNG\r\n\x1a\nfirst"
     second = b"\x89PNG\r\n\x1a\nsecond"
     paths = ["workspace/uploads/first.png", "workspace/uploads/second.png"]
-    monkeypatch.setattr(image_context, "MAX_TOTAL_IMAGE_BYTES", len(first))
     monkeypatch.setattr(
         image_context,
         "get_storage_backend",
@@ -289,7 +286,7 @@ async def test_current_images_obey_one_total_payload_budget(monkeypatch):
     )
 
     image_blocks = [part for part in prepared[0]["content"] if part["type"] == "image_url"]
-    assert len(image_blocks) == 1
+    assert len(image_blocks) == 2
     assert all(path in prepared[0]["content"][-1]["text"] for path in paths)
 
 
@@ -365,8 +362,7 @@ async def test_responses_input_image_is_normalized_without_shape_error():
     }
 
 
-async def test_anthropic_base64_image_is_normalized_and_budgeted(monkeypatch):
-    monkeypatch.setattr(image_context, "MAX_TOTAL_IMAGE_BYTES", len(_LEGACY_PNG_BYTES) - 1)
+async def test_anthropic_base64_image_is_normalized_without_aggregate_budget():
     prepared = await image_context.prepare_messages_for_model(
         [{
             "role": "user",
@@ -383,5 +379,7 @@ async def test_anthropic_base64_image_is_normalized_and_budgeted(monkeypatch):
         supports_vision=True,
     )
 
-    assert isinstance(prepared[0]["content"], str)
-    assert "base64" not in prepared[0]["content"]
+    assert prepared[0]["content"][0] == {
+        "type": "image_url",
+        "image_url": {"url": _LEGACY_PNG_DATA_URL},
+    }

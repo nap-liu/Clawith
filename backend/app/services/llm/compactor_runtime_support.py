@@ -50,16 +50,12 @@ async def _summarize_via_llm(
     span_text: str,
     prior_summary: str | None,
     model: LLMModel,
+    retained_history_text: str | None = None,
     failed_summary: str | None = None,
     failure_reason: str | None = None,
     on_input_bounded: Callable[[bool], None] | None = None,
 ) -> tuple[str, dict | None]:
-    """Run the summary call. Returns ``(summary_text, raw_usage_dict)``.
-
-    Uses the same primary model. The summary is its own request — no
-    tools, no streaming, no agent context — so we instantiate a bare
-    LLM client directly.
-    """
+    """Run one streaming summary call and require a complete terminal response."""
     from app.services.llm import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
     from app.services.model_headers import resolve_model_headers
 
@@ -75,7 +71,15 @@ async def _summarize_via_llm(
                 f"<failed-draft>\n{failed_summary or ''}\n</failed-draft>\n"
                 "</repair-request>"
             )
-        user_payload.append("<chat-segment>\n" + candidate_span + "\n</chat-segment>")
+        user_payload.append(
+            "<replacement-history>\n" + candidate_span + "\n</replacement-history>"
+        )
+        if retained_history_text:
+            user_payload.append(
+                "<retained-history>\n"
+                + retained_history_text
+                + "\n</retained-history>"
+            )
         return [
             LLMMessage(role="system", content=SUMMARY_SYSTEM_PROMPT),
             LLMMessage(role="user", content="\n\n".join(user_payload)),
@@ -98,18 +102,20 @@ async def _summarize_via_llm(
     )
 
     try:
-        if getattr(model, "compact_stream", False):
-            response = await client.stream(
-                messages, max_tokens=model.compact_summary_max_tokens, temperature=0.2,
-            )
-            return response.content or "", response.usage
-        response = await client.complete(
+        response = await client.stream(
             messages,
             max_tokens=get_max_tokens(
                 model.provider, model.model, getattr(model, "max_output_tokens", None)
             ),
             temperature=0.2,
         )
+        if getattr(response, "tool_calls", None):
+            raise RuntimeError("summary_unexpected_tool_call")
+        finish_reason = getattr(response, "finish_reason", None)
+        if finish_reason != "stop":
+            raise RuntimeError(f"summary_incomplete:{finish_reason or 'missing_terminal_status'}")
+        if not str(getattr(response, "content", "") or "").strip():
+            raise RuntimeError("summary_empty_response")
         return response.content or "", response.usage
     finally:
         close = getattr(client, "close", None)

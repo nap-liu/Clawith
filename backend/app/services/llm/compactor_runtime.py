@@ -13,10 +13,7 @@ from app.services.llm.compactor_serialization import (
 )
 from app.services.llm.compactor_summary import (
     append_lossless_archive_reference,
-    append_missing_identifiers,
     build_deterministic_summary,
-    objective_evidence_is_truncated,
-    pin_summary_objective,
     validate_summary,
 )
 from app.services.llm.turn_partition import current_turn_compactable_rows
@@ -275,26 +272,23 @@ async def _do_compact(
             )
 
         expected_span_fingerprint = _span_fingerprint(span_rows)
+        expected_history_fingerprint = _span_fingerprint(rows)
         summary_rows = (
             [turn_partition.current.user_row, *span_rows]
             if current_turn_span and turn_partition.current is not None
             else span_rows
         )
 
-        # 3.5 Internal span sizing is observability only. It must not veto a
-        # required compaction because it is not a provider token count.
+        summary_row_ids = {row.id for row in summary_rows}
+        retained_rows = [row for row in rows if row.id not in summary_row_ids]
         span_text = serialize_span_for_summary(
             summary_rows,
             prefilter=False,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
         )
-        # 4. Summarize the exact serialized view used for the futility estimate.
-        # Keep an unfiltered source for the lossless continuity decision.  The
-        # summary provider sees a bounded head/tail view, but that optimization
-        # must never make a large requirement in the middle unverifiable.
-        unfiltered_span_text = serialize_span_for_summary(
-            summary_rows,
+        retained_history_text = serialize_span_for_summary(
+            retained_rows,
             prefilter=False,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
@@ -303,33 +297,15 @@ async def _do_compact(
             part
             for part in (
                 prior_summary,
-                unfiltered_span_text,
+                span_text,
             )
             if part
         )
-        # The provider receives a bounded head/tail view. Any bytes omitted
-        # from ordinary inline content must remain available through a
-        # lossless archive. Persisted-output envelope bodies are the sole
-        # exception because their complete source already has a durable path.
-        durable_elided_span_text = serialize_span_for_summary(
-            summary_rows,
-            prefilter=False,
-            wrap_user_names=wrap_user_names,
-            name_map=sender_name_map,
-            elide_durable_only=True,
-        )
-        prefilter_omitted_inline_content = span_text != durable_elided_span_text
         objective_evidence_items = objective_evidence_items_from_rows(
             prior_summary=prior_summary,
             rows=summary_rows,
             wrap_user_names=wrap_user_names,
             name_map=sender_name_map,
-        )
-        evidence_max_chars = objective_evidence_limit(model.compact_summary_max_tokens)
-        objective_evidence_truncated = objective_evidence_is_truncated(
-            unfiltered_validation_source,
-            max_chars=evidence_max_chars,
-            evidence_items=objective_evidence_items,
         )
         # Do not occupy a PostgreSQL connection/transaction during one or two
         # potentially slow summary requests. Cross-process serialization is
@@ -337,11 +313,13 @@ async def _do_compact(
         await db.commit()
         recovery_reasons: list[str] = []
         initial_llm_failed = False
+        generation_mode = "semantic"
         summary_usage: dict | None = None
         try:
             summary, summary_usage = await _summarize_via_llm(
                 span_text=span_text,
                 prior_summary=prior_summary,
+                retained_history_text=retained_history_text,
                 model=model,
             )
             from app.services.token_tracker import extract_token_usage, record_token_usage
@@ -356,32 +334,11 @@ async def _do_compact(
             logger.error(f"[compactor] summary LLM call failed for session={session_id}: {first_reason}")
             summary = ""
 
-        # 5. Deterministically preserve exact identifiers before validation.
-        # A structurally sound summary must not brick a session because the
-        # model omitted one opaque UUID, URL, path, or slash command.
-        summary, appended_identifiers = append_missing_identifiers(
-            summary=summary,
-            original_text=unfiltered_validation_source,
-        )
-        summary = pin_summary_objective(
-            summary=summary,
-            original_text=unfiltered_validation_source,
-            max_tokens=model.compact_summary_max_tokens,
-            objective_evidence_items=objective_evidence_items,
-        )
-        if appended_identifiers:
-            logger.info(
-                f"[compactor] appended {len(appended_identifiers)} missing identifiers for session={session_id}"
-            )
-
-        # 6. Validate
+        # Structural validation guarantees loadability, not semantic truth.
         passed, fail_reason, recall = validate_summary(
             summary=summary,
             original_text=unfiltered_validation_source,
             max_tokens=model.compact_summary_max_tokens,
-            objective_text=unfiltered_validation_source,
-            objective_evidence_max_chars=evidence_max_chars,
-            objective_evidence_items=objective_evidence_items,
         )
 
         # A structurally invalid model draft receives exactly one repair
@@ -399,6 +356,7 @@ async def _do_compact(
                 repaired, repaired_usage = await _summarize_via_llm(
                     span_text=span_text,
                     prior_summary=prior_summary,
+                    retained_history_text=retained_history_text,
                     model=model,
                     failed_summary=summary,
                     failure_reason=repair_reason,
@@ -406,27 +364,15 @@ async def _do_compact(
                 repaired_normalized = extract_token_usage(repaired_usage)
                 if repaired_normalized is not None and repaired_normalized.total_tokens > 0:
                     await record_token_usage(agent_id, repaired_normalized)
-                repaired, _ = append_missing_identifiers(
-                    summary=repaired,
-                    original_text=unfiltered_validation_source,
-                )
-                repaired = pin_summary_objective(
-                    summary=repaired,
-                    original_text=unfiltered_validation_source,
-                    max_tokens=model.compact_summary_max_tokens,
-                    objective_evidence_items=objective_evidence_items,
-                )
                 repaired_passed, repaired_reason, repaired_recall = validate_summary(
                     summary=repaired,
                     original_text=unfiltered_validation_source,
                     max_tokens=model.compact_summary_max_tokens,
-                    objective_text=unfiltered_validation_source,
-                    objective_evidence_max_chars=evidence_max_chars,
-                    objective_evidence_items=objective_evidence_items,
                 )
                 if repaired_passed:
                     summary = repaired
                     summary_usage = repaired_usage
+                    generation_mode = "repaired"
                     passed, fail_reason, recall = True, None, repaired_recall
                 else:
                     recovery_reasons.append(f"repair_validation_failed:{repaired_reason}")
@@ -443,14 +389,9 @@ async def _do_compact(
         )
         if archives_abandoned_turn:
             recovery_reasons.append("lossless_archive:abandoned_incomplete_turn")
-        lossless_archive_source: str | None = None
-        if (
-            not passed
-            or objective_evidence_truncated
-            or prefilter_omitted_inline_content
-            or archives_abandoned_turn
-        ):
-            lossless_archive_source = unfiltered_validation_source
+        # Every replacement gets one verified, model-readable source archive.
+        # Semantic success changes the inline handoff, never auditability.
+        lossless_archive_source = unfiltered_validation_source
 
         # Archive I/O can target S3. Perform it after releasing the read
         # transaction and before acquiring the short PostgreSQL advisory lock,
@@ -476,6 +417,7 @@ async def _do_compact(
                     relative_path=archive_materialized.relative_path,
                 )
             else:
+                generation_mode = "degraded"
                 summary = build_deterministic_summary(
                     source_text=unfiltered_validation_source,
                     max_tokens=model.compact_summary_max_tokens,
@@ -493,33 +435,7 @@ async def _do_compact(
                 # archive path; the referenced object is the lossless source.
                 original_text=archive_validation_source,
                 max_tokens=model.compact_summary_max_tokens,
-                objective_text=unfiltered_validation_source,
-                objective_evidence_max_chars=evidence_max_chars,
-                objective_evidence_items=objective_evidence_items,
-                objective_archived=True,
             )
-            if not passed and (
-                objective_evidence_truncated
-                or prefilter_omitted_inline_content
-            ):
-                # A near-limit model draft can become too long after the
-                # mandatory archive reference. Fall back to the bounded local
-                # shell while retaining the same newly-created lossless object.
-                summary = build_deterministic_summary(
-                    source_text=unfiltered_validation_source,
-                    max_tokens=model.compact_summary_max_tokens,
-                    archive_envelope=archive_materialized.llm_view,
-                    objective_evidence_items=objective_evidence_items,
-                )
-                passed, fail_reason, recall = validate_summary(
-                    summary=summary,
-                    original_text=archive_validation_source,
-                    max_tokens=model.compact_summary_max_tokens,
-                    objective_text=unfiltered_validation_source,
-                    objective_evidence_max_chars=evidence_max_chars,
-                    objective_evidence_items=objective_evidence_items,
-                    objective_archived=True,
-                )
             if not passed:
                 raise RuntimeError(f"deterministic_summary_invalid:{fail_reason}")
 
@@ -536,9 +452,24 @@ async def _do_compact(
                 agent_id=agent_id,
                 conversation_id=conversation_id,
             )
+            _, _, fresh_marker_id = await _load_active_marker(db, session_id=session_id)
         except BaseException:
             await _delete_uncommitted_archive(archive_materialized)
             raise
+        if fresh_marker_id != prior_marker_id:
+            await _delete_uncommitted_archive(archive_materialized)
+            await db.rollback()
+            return CompactionResult(
+                triggered=False,
+                skipped_reason="active_compaction_changed_during_compaction",
+            )
+        if _span_fingerprint(fresh_rows) != expected_history_fingerprint:
+            await _delete_uncommitted_archive(archive_materialized)
+            await db.rollback()
+            return CompactionResult(
+                triggered=False,
+                skipped_reason="conversation_changed_during_compaction",
+            )
         if current_anchor_id is not None and not _current_anchor_owns_latest_logical_tail(
             fresh_rows,
             current_anchor_id,
@@ -571,10 +502,22 @@ async def _do_compact(
 
         # 7. Persist the validated model/repair/fallback result atomically.
         new_epoch = (prior_epoch or 0) + 1
-        # The persisted text may include local identifier/objective/archive
-        # additions or be a deterministic replacement. Without an official
-        # counter for that exact final text its token count is unknown.
+        # Without an official counter for the exact final text its count is unknown.
         summary_tokens = None
+
+        if _is_dryrun():
+            await db.rollback()
+            logger.info(
+                f"[compactor] DRYRUN session={session_id} epoch={new_epoch} "
+                f"generation_mode={generation_mode} reason={trigger_reason}"
+            )
+            return CompactionResult(
+                triggered=False,
+                epoch=new_epoch,
+                trigger_prompt_tokens=trigger_prompt_tokens,
+                skipped_reason="dryrun",
+                progress_notice=f"🗜 (dryrun) compaction simulated, epoch={new_epoch}",
+            )
 
         compaction = ChatCompaction(
             id=uuid.uuid4(),
@@ -589,7 +532,9 @@ async def _do_compact(
             trigger_ratio=trigger_ratio,
             superseded_by=None,
             summary_validation_passed=True,
-            validation_failure_reason="; ".join(recovery_reasons) or None,
+            validation_failure_reason="; ".join(
+                [f"generation_mode={generation_mode}", *recovery_reasons]
+            ),
             created_at=datetime.now(timezone.utc),
         )
 
@@ -650,25 +595,9 @@ async def _do_compact(
             await db.rollback()
             raise
 
-        if _is_dryrun():
-            logger.info(
-                f"[compactor] DRYRUN session={session_id} epoch={new_epoch} "
-                f"reason={trigger_reason} ratio={trigger_ratio:.2f} "
-                f"summary_tokens={summary_tokens} recall={recall:.2f} — "
-                f"chat_compactions row written, ChatMessage flags NOT updated"
-            )
-            return CompactionResult(
-                triggered=False,
-                summary_id=compaction.id,
-                epoch=new_epoch,
-                summary_tokens=summary_tokens,
-                trigger_prompt_tokens=trigger_prompt_tokens,
-                skipped_reason="dryrun",
-                progress_notice=f"🗜 (dryrun) compaction simulated, epoch={new_epoch}",
-            )
-
         logger.info(
             f"[compactor] applied session={session_id} epoch={new_epoch} "
+            f"generation_mode={generation_mode} "
             f"reason={trigger_reason} ratio={trigger_ratio:.2f} "
             f"compacted_rows={len(span_rows)} summary_tokens={summary_tokens} "
             f"recall={recall:.2f}"
@@ -696,6 +625,7 @@ async def _load_active_rows(
     conversation_id: str,
 ) -> list[ChatMessage]:
     """All non-compacted messages for this session, oldest first."""
+    from app.services.chat_history_shared import is_model_visible_history_row
     from app.services.message_context_order import order_messages_for_context
 
     result = await db.execute(
@@ -713,13 +643,7 @@ async def _load_active_rows(
     return executed_media_rows(order_messages_for_context([
         row
         for row in result.scalars().all()
-        if not (
-            isinstance(getattr(row, "message_meta", None), dict)
-            and (
-                row.message_meta.get("consumed_by_onmessage")
-                or row.message_meta.get("turn_inbox_state") in {"pending", "processing", "cancelled"}
-            )
-        )
+        if is_model_visible_history_row(row)
     ]))
 
 

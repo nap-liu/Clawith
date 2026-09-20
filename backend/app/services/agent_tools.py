@@ -557,7 +557,7 @@ async def execute_tool(
     tools_for_llm: list[dict] | None = None,
     approved_by_human: bool = False,
     on_progress=None,
-) -> str:
+) -> str | dict:
     from app.services.agent_tools_execute_tool_dispatch_basic import execute_tool_dispatch_basic
     from app.services.agent_tools_execute_tool_dispatch_extended import execute_tool_dispatch_extended
     from app.services.agent_tools_execute_tool_postprocess import execute_tool_postprocess

@@ -149,7 +149,7 @@ def _sync_root_tool_symbols() -> None:
         globals()[_name] = getattr(_agent_tools_root, _name)
 
 
-async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str | None:
+async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str | dict | None:
     _sync_root_tool_symbols()
     tool_name = state.tool_name
     arguments = state.arguments
@@ -166,6 +166,10 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
 
     if tool_name == "list_models":
         return await execute_list_models(state)
+    elif tool_name == "add_media_to_ctx":
+        from app.services.image_context_tool import add_media_to_ctx
+
+        return await add_media_to_ctx(agent_id, arguments.get("files"))
     elif tool_name in MEDIA_AI_NAMES:
         if state.project_workspace == "agent":
             state.arguments = {key: value for key, value in arguments.items() if key != "workspace"}

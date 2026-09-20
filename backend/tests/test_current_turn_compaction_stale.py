@@ -76,5 +76,5 @@ async def test_current_turn_stale_boundary_rejects_new_closed_round(monkeypatch)
     )
 
     assert result.triggered is False
-    assert result.skipped_reason == "compactable_span_changed_during_compaction"
+    assert result.skipped_reason == "conversation_changed_during_compaction"
     assert db.rollback_count == 1

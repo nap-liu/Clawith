@@ -25,8 +25,8 @@ async def execute_tool_postprocess(
     agent_id: uuid.UUID,
     user_id: uuid.UUID | None,
     session_id: str,
-    result: str,
-) -> str:
+    result: str | dict,
+) -> str | dict:
     _sync_root_tool_symbols()
     # Log tool call activity (skip noisy read operations). Keep the result
     # shape intact for diagnostics and mask only explicit credential values.

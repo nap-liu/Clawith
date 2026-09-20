@@ -68,6 +68,25 @@ def _is_hidden_runtime_anchor(row: Any) -> bool:
     )
 
 
+def is_model_visible_history_row(row: Any) -> bool:
+    """Apply the ordinary LLM-history visibility boundary to one durable row."""
+    metadata = getattr(row, "message_meta", None)
+    meta = metadata if isinstance(metadata, dict) else {}
+    return not (
+        _is_hidden_runtime_anchor(row)
+        or meta.get("consumed_by_onmessage")
+        or meta.get("delivery_claim")
+        or meta.get("kind") == "subagent_parent_message"
+        or meta.get("turn_inbox_state") in {"pending", "processing", "cancelled"}
+        or meta.get("turn_control_only")
+        or meta.get("artifact_role") == "command_reply"
+        or (
+            getattr(row, "role", None) == "assistant"
+            and meta.get("artifact_role") == "confirmation_intro"
+        )
+    )
+
+
 @dataclass
 class _SyntheticSummaryMessage:
     """ChatMessage-shaped object representing an injected compaction
