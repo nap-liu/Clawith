@@ -686,3 +686,44 @@ async def test_testrun_returns_501_when_sandbox_not_aio(monkeypatch):
     with pytest.raises(HTTPException) as exc_info:
         await cli_tools_api.test_run_cli_tool(tool_id=tool.id, body=body, db=db, current_user=user)
     assert exc_info.value.status_code == 501
+
+
+@pytest.mark.asyncio
+async def test_testrun_scopes_resolved_env_to_cli_wrapper(monkeypatch):
+    """test-run must use the same signed per-wrapper env contract as Agent runs."""
+    from app.services.sandbox.base import ExecutionResult
+    from app.services.sandbox.config import SandboxConfig, SandboxType
+    import app.config as app_config
+    import app.services.sandbox.registry as sandbox_registry
+
+    tool = _make_tool(config=CliToolConfig(
+        binary=BinaryMetadata(sha256="a" * 64, size=1024),
+        env={"SERVICE_USER_PHONE": "$user.phone", "STATIC": "value"},
+    ).model_dump(mode="json"))
+    user = _platform_admin()
+    user.primary_mobile = "13800000000"
+    captured = {}
+
+    class Backend:
+        async def execute(self, **kwargs):
+            captured.update(kwargs)
+            return ExecutionResult(
+                success=True, stdout="ok", stderr="", exit_code=0, duration_ms=1,
+            )
+
+    monkeypatch.setattr(app_config, "get_sandbox_config", lambda: SandboxConfig(type=SandboxType.AIO_SANDBOX))
+    monkeypatch.setattr(sandbox_registry, "get_sandbox_backend", lambda _config: Backend())
+
+    result = await cli_tools_api.test_run_cli_tool(
+        tool_id=tool.id,
+        body=TestRunRequest(command="svc status"),
+        db=FakeDB(tool=tool),
+        current_user=user,
+    )
+
+    assert result.exit_code == 0
+    assert "env" not in captured["inject"]
+    assert captured["inject"]["wrappers"][0]["env"] == {
+        "SERVICE_USER_PHONE": "13800000000",
+        "STATIC": "value",
+    }

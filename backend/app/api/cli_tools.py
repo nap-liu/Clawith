@@ -683,8 +683,11 @@ async def test_run_cli_tool(
     # wrapper write + env export into the per-exec child bash). Mirrors the
     # agent-side build_cli_injection shape so test-run exercises the real path.
     injection = {
-        "wrappers": [{"name": tool.name, "binary_path": binary_path}],
-        "env": render_env(cfg.env, ctx),
+        "wrappers": [{
+            "name": tool.name,
+            "binary_path": binary_path,
+            "env": render_env(cfg.env, ctx),
+        }],
     }
     backend = get_sandbox_backend(sandbox_config)
     result = await backend.execute(code=body.command, language="bash", timeout=60, work_dir="/data/agents", agent_id=f"cli-testrun-{tool.id}", inject=injection)
